@@ -156,14 +156,26 @@ class OptimizeExecutor(
 
   private val isMultiDimClustering = zOrderByColumns.nonEmpty
 
-  def optimize(): Seq[Row] = {
+  def optimize(isAutoCompact: Boolean = false): Seq[Row] = {
     recordDeltaOperation(deltaLog, "delta.optimize") {
       val minFileSize = sparkSession.sessionState.conf.getConf(
         DeltaSQLConf.DELTA_OPTIMIZE_MIN_FILE_SIZE)
-      val maxFileSize = sparkSession.sessionState.conf.getConf(
-        DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE)
+      val maxFileSize = if (isAutoCompact) {
+        sparkSession.sessionState.conf.getConf(DeltaSQLConf.AUTO_COMPACT_MAX_FILE_SIZE)
+      } else {
+        sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE)
+      }
       require(minFileSize > 0, "minFileSize must be > 0")
       require(maxFileSize > 0, "maxFileSize must be > 0")
+
+      val minNumFilesInDir = if (isAutoCompact) {
+        val minNumFiles =
+          sparkSession.sessionState.conf.getConf(DeltaSQLConf.AUTO_COMPACT_MIN_NUM_FILES)
+        require(minNumFiles > 0, "minNumFiles must be > 0")
+        minNumFiles
+      } else {
+        2
+      }
 
       val txn = deltaLog.startTransaction()
       if (txn.readVersion == -1) {
@@ -175,9 +187,27 @@ class OptimizeExecutor(
 
       // select all files in case of multi-dimensional clustering
       val filesToProcess = candidateFiles.filter(_.size < minFileSize || isMultiDimClustering)
-      val partitionsToCompact = filesToProcess.groupBy(_.partitionValues).toSeq
+      val partitionsToCompact = filesToProcess
+        .groupBy(_.partitionValues)
+        .filter(_._2.size >= minNumFilesInDir)
+        .toSeq
 
-      val jobs = groupFilesIntoBins(partitionsToCompact, maxFileSize)
+      val groupedJobs = groupFilesIntoBins(partitionsToCompact, maxFileSize)
+
+      val jobs = if (isAutoCompact) {
+        var acc = 0L
+        val maxCompactBytes =
+          sparkSession.sessionState.conf.getConf(DeltaSQLConf.AUTO_COMPACT_MAX_COMPACT_BYTES)
+        // bins with more files are prior to less files.
+        groupedJobs
+          .sortBy(-_._2.length)
+          .takeWhile { job =>
+            acc += job._2.map(_.size).sum
+            acc <= maxCompactBytes
+          }
+      } else {
+        groupedJobs
+      }
 
       val parallelJobCollection = new ParVector(jobs.toVector)
 
@@ -199,7 +229,7 @@ class OptimizeExecutor(
       val addedFiles = updates.collect { case a: AddFile => a }
       val removedFiles = updates.collect { case r: RemoveFile => r }
       if (addedFiles.size > 0) {
-        val operation = DeltaOperations.Optimize(partitionPredicate.map(_.sql))
+        val operation = DeltaOperations.Optimize(partitionPredicate.map(_.sql), isAutoCompact)
         val metrics = createMetrics(sparkSession.sparkContext, addedFiles, removedFiles)
         commitAndRetry(txn, operation, updates, metrics) { newTxn =>
           val newPartitionSchema = newTxn.metadata.partitionSchema

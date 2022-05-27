@@ -20,6 +20,7 @@ package org.apache.spark.sql.delta.sources
 import java.util.concurrent.TimeUnit
 
 import org.apache.spark.internal.config.ConfigBuilder
+import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.storage.StorageLevel
 
@@ -701,6 +702,34 @@ trait DeltaSQLConfBase {
         .intConf
         .checkValue(_ > 0, "'optimize.maxThreads' must be positive.")
         .createWithDefault(15)
+
+  val AUTO_COMPACT_ENABLED =
+    buildConf("autoCompact.enabled")
+      .internal()
+      .doc("Enable auto compaction to trigger a compaction job for small files after table update.")
+      .booleanConf
+      .createOptional
+
+  val AUTO_COMPACT_MAX_FILE_SIZE =
+    buildConf("autoCompact.maxFileSize")
+      .internal()
+      .doc("Maximum file size when for auto compaction.")
+      .longConf
+      .createWithDefault(128 * 1024 * 1024)
+
+  val AUTO_COMPACT_MIN_NUM_FILES =
+    buildConf("autoCompact.minNumFiles")
+      .internal()
+      .doc("Minimum number of files in a directory to trigger auto compaction.")
+      .longConf
+      .createWithDefault(50)
+
+  val AUTO_COMPACT_MAX_COMPACT_BYTES =
+    buildConf("autoCompact.maxCompactBytes")
+      .internal()
+      .doc("Maximum amount of data for auto compaction.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("50GB")
 
   val DELTA_ALTER_TABLE_CHANGE_COLUMN_CHECK_EXPRESSIONS =
     buildConf("alterTable.changeColumn.checkExpressions")

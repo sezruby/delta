@@ -343,8 +343,8 @@ object DeltaOperations {
 
   /** Recorded when optimizing the table. */
   case class Optimize(
-      predicate: Seq[String]
-  ) extends OptimizeOrReorg(OPTIMIZE_OPERATION_NAME) {
+      predicate: Seq[String],
+      auto: Boolean) extends OptimizeOrReorg(OPTIMIZE_OPERATION_NAME) {
     override val parameters: Map[String, Any] = Map(
       "predicate" -> JsonUtils.toJson(predicate)
     )
