@@ -21,6 +21,7 @@ import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.commands.OptimizeExecutor
 import org.apache.spark.sql.delta.metering.DeltaLogging
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
 /**
  * Post commit hook to trigger compaction.
@@ -33,7 +34,16 @@ object DoAutoCompaction extends PostCommitHook with DeltaLogging with Serializab
       spark: SparkSession,
       txn: OptimisticTransactionImpl,
       committedActions: Seq[Action]): Unit = {
-    new OptimizeExecutor(spark, txn.deltaLog, Seq.empty).optimize(isAutoCompact = true)
+    if (spark.sessionState.conf.getConf(DeltaSQLConf.AUTO_COMPACT_TARGET).equals("table")) {
+      new OptimizeExecutor(spark, txn.deltaLog, Seq.empty, Seq.empty).optimize(isAutoCompact = true)
+    } else {
+      // commit or partition option.
+      val targetFiles = committedActions.collect {
+        case a: AddFile => a
+      }
+      new OptimizeExecutor(spark, txn.deltaLog, Seq.empty, Seq.empty)
+        .optimize(isAutoCompact = true, targetFiles)
+    }
   }
 
   override def handleError(error: Throwable, version: Long): Unit = {

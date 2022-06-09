@@ -215,4 +215,72 @@ class DeltaAutoOptimizeSuite extends QueryTest with SharedSparkSession with Delt
       }
     }
   }
+
+  test("test autoCompact.target config") {
+    withTempDir { dir =>
+      val rootPath = dir.getCanonicalPath
+      val path1 = new Path(rootPath, "table1").toString
+      val path2 = new Path(rootPath, "table2").toString
+      val path3 = new Path(rootPath, "table3").toString
+
+      def testAutoCompactTarget(path: String, target: String, expectedColC1Cnt: Long): Unit = {
+        writeDataToCheckAutoCompact(100, path, partitioned = true)
+        val dt = io.delta.tables.DeltaTable.forPath(path)
+
+        withSQLConf(
+          "spark.microsoft.delta.autoCompact.enabled" -> "true",
+          "spark.microsoft.delta.autoCompact.target" -> target) {
+          dt.toDF
+            .filter("colC == 1")
+            .repartition(50)
+            .write
+            .format("delta")
+            .mode("append")
+            .save(path)
+
+          val dl = DeltaLog.forTable(spark, path)
+          // version 0: write, 1: append, 2: autoCompact
+          assert(dl.snapshot.version == 2)
+
+          {
+            val afterAutoCompact = dl.snapshot.allFiles.filter(col("path").contains("colC=1")).count
+            val beforeAutoCompact = dl
+              .getSnapshotAt(dl.snapshot.version - 1)
+              .allFiles
+              .filter(col("path").contains("colC=1"))
+              .count
+
+            assert(beforeAutoCompact == 150)
+            assert(afterAutoCompact == expectedColC1Cnt)
+          }
+
+          {
+            val afterAutoCompact = dl.snapshot.allFiles.filter(col("path").contains("colC=0")).count
+            val beforeAutoCompact = dl
+              .getSnapshotAt(dl.snapshot.version - 1)
+              .allFiles
+              .filter(col("path").contains("colC=0"))
+              .count
+
+            assert(beforeAutoCompact == 100)
+            assert(afterAutoCompact == 100)
+          }
+        }
+      }
+      // Existing files are not optimized; newly added 50 files should be optimized.
+      // 100 of colC=0, 101 of colC=1
+      testAutoCompactTarget(path1, "commit", 101)
+      // Modified partition should be optimized.
+      // 100 of colC=0, 1 of colC=1
+      testAutoCompactTarget(path2, "partition", 1)
+
+      withSQLConf(
+        "spark.microsoft.delta.autoCompact.enabled" -> "true",
+        "spark.microsoft.delta.autoCompact.target" -> "partition") {
+        writeDataToCheckAutoCompact(100, path3)
+        // non-partitioned data should work with "partition" option.
+        checkTableVersionAndNumFiles(path3, 1, 1)
+      }
+    }
+  }
 }

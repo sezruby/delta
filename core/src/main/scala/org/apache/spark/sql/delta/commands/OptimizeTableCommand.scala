@@ -156,7 +156,7 @@ class OptimizeExecutor(
 
   private val isMultiDimClustering = zOrderByColumns.nonEmpty
 
-  def optimize(isAutoCompact: Boolean = false): Seq[Row] = {
+  def optimize(isAutoCompact: Boolean = false, targetFiles: Seq[AddFile] = Nil): Seq[Row] = {
     recordDeltaOperation(deltaLog, "delta.optimize") {
       val minFileSize = sparkSession.sessionState.conf.getConf(
         DeltaSQLConf.DELTA_OPTIMIZE_MIN_FILE_SIZE)
@@ -182,7 +182,27 @@ class OptimizeExecutor(
         throw DeltaErrors.notADeltaTableException(deltaLog.dataPath.toString)
       }
 
-      val candidateFiles = txn.filterFiles(partitionPredicate)
+      val candidateFiles = if (!isAutoCompact) {
+        txn.filterFiles(partitionPredicate)
+      } else {
+        val autoCompactTarget =
+          sparkSession.sessionState.conf.getConf(DeltaSQLConf.AUTO_COMPACT_TARGET)
+        // Filter the candidate files according to autoCompact.target config.
+        autoCompactTarget match {
+          case "table" =>
+            txn.filterFiles()
+          case "commit" =>
+            targetFiles
+          case "partition" =>
+            val eligiblePartitions = targetFiles.map(_.partitionValues).toSet
+            txn.filterFiles().filter(f => eligiblePartitions.contains(f.partitionValues))
+          case _ =>
+            logError(s"Invalid config for autoCompact.target: $autoCompactTarget. " +
+              s"Use the default value 'table'.")
+            txn.filterFiles()
+        }
+      }
+
       val partitionSchema = txn.metadata.partitionSchema
 
       // select all files in case of multi-dimensional clustering
