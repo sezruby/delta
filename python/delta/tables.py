@@ -236,7 +236,7 @@ class DeltaTable(object):
             deltaTable.vacuum(100)  # vacuum files not required by versions more than 100 hours old
 
         :param retentionHours: Optional number of hours retain history. If not specified, then the
-                               default retention period of 168 hours (7 days) will be used.
+                               default retention period of 168 hours (7 days) will be usedd.
         """
         jdt = self._jdt
         if retentionHours is None:
