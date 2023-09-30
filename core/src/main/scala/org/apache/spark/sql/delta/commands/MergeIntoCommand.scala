@@ -197,6 +197,7 @@ object MergeStats {
  * @param matchedClauses    All info related to matched clauses.
  * @param notMatchedClauses  All info related to not matched clause.
  * @param migratedSchema    The final schema of the target - may be changed by schema evolution.
+ * @param autoSchemaMergeEnabled    Auto schema merge enabled config used in PreprocessTableMerge.
  */
 case class MergeIntoCommand(
     @transient source: LogicalPlan,
@@ -205,13 +206,14 @@ case class MergeIntoCommand(
     condition: Expression,
     matchedClauses: Seq[DeltaMergeIntoMatchedClause],
     notMatchedClauses: Seq[DeltaMergeIntoInsertClause],
-    migratedSchema: Option[StructType]) extends RunnableCommand
+    migratedSchema: Option[StructType],
+    autoSchemaMergeEnabled: Boolean) extends RunnableCommand
   with DeltaCommand with PredicateHelper with AnalysisHelper with ImplicitMetadataOperation {
 
   import SQLMetrics._
   import MergeIntoCommand._
 
-  override val canMergeSchema: Boolean = conf.getConf(DeltaSQLConf.DELTA_SCHEMA_AUTO_MIGRATE)
+  override val canMergeSchema: Boolean = autoSchemaMergeEnabled
   override val canOverwriteSchema: Boolean = false
 
   @transient private lazy val sc: SparkContext = SparkContext.getOrCreate()
@@ -265,6 +267,7 @@ case class MergeIntoCommand(
             isOverwriteMode = false, rearrangeOnly = false)
         }
 
+        val targetOutputCols = getTargetOutputCols(deltaTxn, spark)
         val deltaActions = {
           if (isSingleInsertOnly && spark.conf.get(DeltaSQLConf.MERGE_INSERT_ONLY_ENABLED)) {
             writeInsertsOnlyWhenNoMatchedClauses(spark, deltaTxn)
@@ -334,7 +337,9 @@ case class MergeIntoCommand(
     // - the target file name the row is from to later identify the files touched by matched rows
     val joinToFindTouchedFiles = {
       val sourceDF = Dataset.ofRows(spark, source)
-      val targetDF = Dataset.ofRows(spark, buildTargetPlanWithFiles(deltaTxn, dataSkippedFiles))
+      val targetDF = Dataset
+        .ofRows(spark,
+          buildTargetPlanWithFiles(deltaTxn, spark, dataSkippedFiles, targetOutputCols))
         .withColumn(ROW_ID_COL, monotonically_increasing_id())
         .withColumn(FILE_NAME_COL, input_file_name())
       sourceDF.join(targetDF, new Column(condition), "inner")
@@ -423,7 +428,7 @@ case class MergeIntoCommand(
 
     // target DataFrame
     val targetDF = Dataset.ofRows(
-      spark, buildTargetPlanWithFiles(deltaTxn, dataSkippedFiles))
+      spark, buildTargetPlanWithFiles(deltaTxn, spark, dataSkippedFiles, targetOutputCols))
 
     val insertDf = sourceDF.join(targetDF, new Column(condition), "leftanti")
       .select(outputCols: _*)
@@ -462,7 +467,7 @@ case class MergeIntoCommand(
 
     // Generate a new logical plan that has same output attributes exprIds as the target plan.
     // This allows us to apply the existing resolved update/insert expressions.
-    val newTarget = buildTargetPlanWithFiles(deltaTxn, filesToRewrite)
+    val newTarget = buildTargetPlanWithFiles(deltaTxn, spark, filesToRewrite, targetOutputCols)
     val joinType = if (isMatchedOnly &&
       spark.conf.get(DeltaSQLConf.MERGE_MATCHED_ONLY_ENABLED)) {
       "rightOuter"
@@ -568,8 +573,9 @@ case class MergeIntoCommand(
    */
   private def buildTargetPlanWithFiles(
     deltaTxn: OptimisticTransaction,
-    files: Seq[AddFile]): LogicalPlan = {
-    val targetOutputCols = getTargetOutputCols(deltaTxn)
+    spark: SparkSession,
+    files: Seq[AddFile],
+    targetOutputCols: Seq[NamedExpression]): LogicalPlan = {
     val plan = {
       // We have to do surgery to use the attributes from `targetOutputCols` to scan the table.
       // In cases of schema evolution, they may not be the same type as the original attributes.
@@ -590,8 +596,8 @@ case class MergeIntoCommand(
     // create an alias
     val aliases = plan.output.map {
       case newAttrib: AttributeReference =>
-        val existingTargetAttrib = getTargetOutputCols(deltaTxn).find { col =>
-          conf.resolver(col.name, newAttrib.name)
+        val existingTargetAttrib = targetOutputCols.find { col =>
+          spark.sessionState.conf.resolver(col.name, newAttrib.name)
         }.getOrElse {
             throw new AnalysisException(
               s"Could not find ${newAttrib.name} among the existing target output " +
@@ -619,9 +625,11 @@ case class MergeIntoCommand(
 
   private def seqToString(exprs: Seq[Expression]): String = exprs.map(_.sql).mkString("\n\t")
 
-  private def getTargetOutputCols(txn: OptimisticTransaction): Seq[NamedExpression] = {
+  private def getTargetOutputCols(
+    txn: OptimisticTransaction,
+    spark: SparkSession): Seq[NamedExpression] = {
     txn.metadata.schema.map { col =>
-      target.output.find(attr => conf.resolver(attr.name, col.name)).map { a =>
+      target.output.find(attr => spark.sessionState.conf.resolver(attr.name, col.name)).map { a =>
         AttributeReference(col.name, col.dataType, col.nullable)(a.exprId)
       }.getOrElse(
         Alias(Literal(null), col.name)())
@@ -712,7 +720,7 @@ object MergeIntoCommand {
       val outputProj = UnsafeProjection.create(outputRowEncoder.schema)
 
       def shouldDeleteRow(row: InternalRow): Boolean =
-        row.getBoolean(outputRowEncoder.schema.fields.size)
+        row.getBoolean(row.numFields - 2)
 
       def processRow(inputRow: InternalRow): InternalRow = {
         if (targetRowHasNoMatchPred.eval(inputRow)) {

@@ -61,8 +61,8 @@ case class PreprocessTableMerge(override val conf: SQLConf)
     (matched ++ notMatched).filter(_.condition.nonEmpty).foreach { clause =>
       checkCondition(clause.condition.get, clause.clauseType.toUpperCase(Locale.ROOT))
     }
-
-    val shouldAutoMigrate = conf.getConf(DeltaSQLConf.DELTA_SCHEMA_AUTO_MIGRATE) && migrateSchema
+    val canMergeSchema = conf.getConf(DeltaSQLConf.DELTA_SCHEMA_AUTO_MIGRATE)
+    val shouldAutoMigrate = canMergeSchema && migrateSchema
     val finalSchema = if (shouldAutoMigrate) {
       // The implicit conversions flag allows any type to be merged from source to target if Spark
       // SQL considers the source type implicitly castable to the target. Normally, mergeSchemas
@@ -208,6 +208,6 @@ case class PreprocessTableMerge(override val conf: SQLConf)
 
     MergeIntoCommand(
       source, target, tahoeFileIndex, condition,
-      processedMatched, processedNotMatched, Some(finalSchema))
+      processedMatched, processedNotMatched, Some(finalSchema), canMergeSchema)
   }
 }
