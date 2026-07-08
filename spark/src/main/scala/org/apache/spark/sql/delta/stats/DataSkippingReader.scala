@@ -286,21 +286,28 @@ trait DataSkippingReaderBase
         DeltaSQLConf.DELTA_DATASKIPPING_PARTITION_LIKE_FILTERS_ADDITIONAL_SUPPORTED_EXPRESSIONS)
       .toSet.flatMap((exprs: String) => exprs.split(","))
 
-  /** Returns a DataFrame expression to obtain a list of files with parsed statistics. */
-  private def withStatsInternal0: DataFrame = {
-    val parsedStats = from_json(col("stats"), statsSchema)
+  /**
+   * Parses (and, when the schema contains VariantType, Z85-decodes) the JSON `statsCol` into the
+   * `statsSchema` struct. Shared by [[withStatsInternal0]] and conflict-detection data skipping
+   * ([[filterFilesByDataSkipping]]) so both parse stats the same way.
+   */
+  private def parseAndDecodeStats(statsCol: Column): Column = {
+    val parsedStats = from_json(statsCol, statsSchema)
     // Only use DecodeNestedZ85EncodedVariant if the schema contains VariantType.
     // This avoids performance overhead for tables without variant columns.
     // `DecodeNestedZ85EncodedVariant` is a temporary workaround since the Spark 4.1 from_json
     // expression has no way to decode a VariantVal from an encoded Z85 string.
     // TODO: Add Z85 decoding to Variant in Spark 4.2 and use that from_json option here.
-    val decodedStats = if (SchemaUtils.checkForVariantTypeColumnsRecursively(statsSchema)) {
+    if (SchemaUtils.checkForVariantTypeColumnsRecursively(statsSchema)) {
       Column(DecodeNestedZ85EncodedVariant(parsedStats.expr))
     } else {
       parsedStats
     }
-    allFiles.withColumn("stats", decodedStats)
   }
+
+  /** Returns a DataFrame expression to obtain a list of files with parsed statistics. */
+  private def withStatsInternal0: DataFrame =
+    allFiles.withColumn("stats", parseAndDecodeStats(col("stats")))
 
   private lazy val withStatsCache =
     cacheDS(withStatsInternal0, s"Delta Table State with Stats #$version - $redactedPath")
@@ -639,6 +646,75 @@ trait DataSkippingReaderBase
       convertDataFrameToAddFiles(df)
     }
     files.toSeq -> Seq(DataSize(totalSize), DataSize(partitionSize), DataSize(scanSize))
+  }
+
+  /**
+   * Builds a single [[DataSkippingPredicate]] (skipping expression + the stats it references) from
+   * `dataFilters`, mirroring [[filesForScan]]'s eligibility filtering, per-filter construction and
+   * conjunction fold. Returns None when stats skipping is unavailable or no eligible filter yields
+   * a predicate. The filters are AND-combined, so callers must pass filters from a single logical
+   * read (predicates from independent reads have OR, not AND, semantics).
+   */
+  private[delta] def buildDataSkippingPredicate(
+      dataFilters: Seq[Expression]): Option[DataSkippingPredicate] = {
+    import DeltaTableUtils._
+    if (!useStats) return None
+    // Mirror filesForScan eligibility: drop subquery / non-deterministic / metadata filters, so we
+    // never build a skipping predicate that could wrongly exclude a matching file.
+    val eligibleFilters = dataFilters.filterNot { f =>
+      containsSubquery(f) || !f.deterministic || f.exists {
+        case MetadataAttribute(_) => true
+        case _ => false
+      }
+    }
+    val constructDataFilters = new DataFiltersBuilder(
+      spark = spark,
+      dataSkippingType = DeltaDataSkippingType.dataSkippingOnlyV1,
+      getStatsColumnOpt = (s: StatsColumn) => getStatsColumnOpt(s))
+    eligibleFilters
+      .flatMap(f => constructDataFilters(f))
+      .reduceOption((skip1, skip2) => DataSkippingPredicate(
+        skip1.expr && skip2.expr, skip1.referencedStats ++ skip2.referencedStats))
+  }
+
+  /**
+   * Conflict-detection helper (reader-side data skipping): returns the subset of `files` whose
+   * statistics do NOT prove they fail `dataFilters` -- i.e. the files that could still match and
+   * therefore must be treated as conflicts. Files with missing/insufficient stats (or when skipping
+   * is unavailable) are kept.
+   *
+   * `dataFilters` must come from a single logical read: they are AND-combined via
+   * [[buildDataSkippingPredicate]]. Callers with multiple independent reads must invoke this per
+   * read and union the survivors (OR semantics).
+   *
+   * One-way safe: it applies `expr || !verifyStatsForFilter(...)` exactly as
+   * [[getDataSkippedFiles]], so a file is dropped only when its stats *prove* it cannot match -- a
+   * real conflict is never turned into a false negative. Returns the original [[AddFile]]s (matched
+   * by path), stats untouched.
+   */
+  private[delta] def filterFilesByDataSkipping(
+      files: Seq[AddFile],
+      dataFilters: Seq[Expression]): Seq[AddFile] = {
+    import org.apache.spark.sql.delta.implicits._
+    if (files.isEmpty || dataFilters.isEmpty || schema.isEmpty) return files
+    buildDataSkippingPredicate(dataFilters) match {
+      // No usable data-skipping predicate -> keep all files (conservative).
+      case None => files
+      case Some(pred) =>
+        val survivingPaths = recordFrameProfile(
+            "Delta", "DataSkippingReader.filterFilesByDataSkipping") {
+          // `expr || !verifyStatsForFilter(...)` keeps any file whose referenced stats are
+          // missing/NULL (mirrors getDataSkippedFiles): only skip when stats prove no match.
+          files.toDF(spark)
+            .withColumn("stats", parseAndDecodeStats(col("stats")))
+            .where(pred.expr || !verifyStatsForFilter(pred.referencedStats))
+            .select("path")
+            .collect()
+            .map(_.getString(0))
+            .toSet
+        }
+        files.filter(f => survivingPaths.contains(f.path))
+    }
   }
 
   private def getCorrectDataSkippingType(
