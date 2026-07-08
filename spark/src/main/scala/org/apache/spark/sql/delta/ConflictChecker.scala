@@ -994,14 +994,41 @@ private[delta] class ConflictChecker(
       return None
     }
 
+    // Reader-side data skipping: narrow the candidate files using the read snapshot's column-stats
+    // skipping. A concurrently-added file whose stats prove it cannot match the read predicates is
+    // not a conflict -- this is what lets unpartitioned / liquid-clustered tables avoid conflicting
+    // on every added file below. Data predicates are applied *per read predicate* and the survivors
+    // unioned (OR across reads), because independent reads have OR, not AND, semantics: a file is a
+    // candidate if it could match ANY read; it is dropped only if its stats prove it fails EVERY
+    // read. Skipping is not applied for a whole-table read, where every added file must conflict.
+    val candidateFiles =
+      if (spark.conf.get(DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED) &&
+          !currentTransactionInfo.readWholeTable) {
+        val readSnapshot = currentTransactionInfo.readSnapshot
+        val survivingPaths = currentTransactionInfo.readPredicates.iterator.flatMap { rp =>
+          readSnapshot.filterFilesByDataSkipping(files, rp.dataPredicates)
+        }.map(_.path).toSet
+        val remaining = files.filter(f => survivingPaths.contains(f.path))
+        if (remaining.size < files.size) {
+          recordDeltaEvent(deltaLog,
+            opType = "delta.conflictDetection.dataSkipping.filesSkipped",
+            data = Map(
+              "candidateFiles" -> files.size,
+              "skippedFiles" -> (files.size - remaining.size)))
+        }
+        remaining
+      } else {
+        files
+      }
+
     // There is no reason to filter files if the table is not partitioned.
     if (currentTransactionInfo.readWholeTable ||
         currentTransactionInfo.readSnapshot.metadata.partitionColumns.isEmpty) {
-      return files.headOption
+      return candidateFiles.headOption
     }
 
     import org.apache.spark.sql.delta.implicits._
-    val filesDf = files.toDF(spark)
+    val filesDf = candidateFiles.toDF(spark)
 
     spark.conf.get(DeltaSQLConf.DELTA_CONFLICT_DETECTION_WIDEN_NONDETERMINISTIC_PREDICATES) match {
       case DeltaSQLConf.NonDeterministicPredicateWidening.OFF =>
