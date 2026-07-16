@@ -35,6 +35,7 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.storage.dv.DeletionVectorStore
 import org.apache.spark.sql.delta.util.DeltaSparkPlanUtils.CheckDeterministicOptions
 import org.apache.spark.sql.delta.util.FileNames
+import org.apache.spark.sql.delta.util.JsonUtils
 import io.delta.storage.commit.UpdatedActions
 import io.delta.storage.commit.uccommitcoordinator.UCCommitCoordinatorClient
 import io.delta.storage.commit.uniform.UniformMetadata
@@ -316,6 +317,11 @@ private[delta] class ConflictChecker(
     // the same file no longer aborts. Runs after row-ID reassignment so merged files keep stable
     // base row IDs.
     resolveRowLevelConflicts()
+
+    // Compaction OPTIMIZE vs concurrent row-level DML: remap the concurrent deletion vector from
+    // each removed source file onto the compacted output file (offset arithmetic) instead of
+    // aborting. Compaction only; reclustering / already-DV'd sources / missing composition abort.
+    resolveOptimizeConflicts()
 
     // Data file checks.
     checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn()
@@ -1140,6 +1146,11 @@ private[delta] class ConflictChecker(
       DeletionVectorUtils.deletionVectorsWritable(
         currentTransactionInfo.protocol, currentTransactionInfo.metadata)
 
+  private lazy val optimizeReconciliationEnabled: Boolean =
+    spark.conf.get(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED) &&
+      DeletionVectorUtils.deletionVectorsWritable(
+        currentTransactionInfo.protocol, currentTransactionInfo.metadata)
+
   /** The operation name of the winning commit, if available. */
   private lazy val winningOperationName: Option[String] =
     winningCommitSummary.commitInfo.map(_.operation)
@@ -1288,6 +1299,125 @@ private[delta] class ConflictChecker(
           data = Map(
             "winningCommitVersion" -> winningCommitVersion,
             "resolvedPaths" -> rowLevelResolvedPaths.size,
+            "winningOperation" -> winningOperationName.getOrElse("UNKNOWN")))
+      }
+    }
+  }
+
+  /**
+   * Compaction OPTIMIZE vs a concurrent row-level DML. An OPTIMIZE that removed a source file `F`
+   * and rewrote it (order-preserving) into a compacted output `O` conflicts with a concurrent
+   * DELETE/UPDATE that added a deletion vector to `F`. Instead of aborting, remap the concurrent
+   * DV onto `O`: `F`'s rows occupy `O` at positions `[offset, offset + numRecords(F))` in write
+   * order (recorded in the [[AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION]] tag), so a deleted physical
+   * row `i` in `F` maps to `offset + i` in `O`, unioned into `O`'s deletion vector.
+   *
+   * Conservative by design: only for tagged (order-preserving compaction) outputs, only when `F`
+   * carried no deletion vector at read time (otherwise the physical index is not the output rank),
+   * and only if every conflicting source is remappable; otherwise fall through to the standard
+   * checks (abort). Handles the direction where OPTIMIZE is the current (losing) transaction.
+   */
+  private def resolveOptimizeConflicts(): Unit = {
+    if (!optimizeReconciliationEnabled) return
+
+    // Winning transaction's DV updates (a concurrent DELETE/UPDATE added a DV to a file).
+    val winningRemovedPaths = winningCommitSummary.removedFiles.map(_.path).toSet
+    val winningDvUpdates: Map[String, AddFile] = winningCommitSummary.addedFiles.iterator
+      .filter(a => a.deletionVector != null && winningRemovedPaths.contains(a.path))
+      .map(a => a.path -> a)
+      .toMap
+    if (winningDvUpdates.isEmpty) return
+
+    // Current OPTIMIZE outputs that recorded their source composition, plus its removed sources.
+    val taggedOutputs = currentTransactionInfo.actions.collect {
+      case a: AddFile if a.tag(AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION).isDefined => a
+    }
+    if (taggedOutputs.isEmpty) return
+    val currentRemoveByPath = currentTransactionInfo.actions.collect {
+      case r: RemoveFile => r.path -> r
+    }.toMap
+
+    // source file path -> (compacted output AddFile, offset of its rows within the output).
+    val srcToOutput = mutable.Map.empty[String, (AddFile, Long)]
+    for (out <- taggedOutputs) {
+      val composition = JsonUtils.fromJson[Seq[Seq[String]]](
+        out.tag(AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION).get)
+      var offset = 0L
+      for (entry <- composition) {
+        srcToOutput(entry.head) = (out, offset)
+        offset += entry(1).toLong
+      }
+    }
+
+    val sharedPaths = winningDvUpdates.keySet
+      .intersect(srcToOutput.keySet)
+      .intersect(currentRemoveByPath.keySet)
+    if (sharedPaths.isEmpty) return
+
+    recordTime("resolved-optimize-conflicts") {
+      val dvStore = DeletionVectorStore.createInstance(deltaLog.newDeltaHadoopConf())
+      val tablePath = deltaLog.dataPath
+
+      // Accumulate the remapped DV per output file, starting from its existing DV.
+      val outputDv = mutable.Map.empty[String, RoaringBitmapArray]
+      val resolvedSources = mutable.Set.empty[String]
+      var allResolvable = true
+
+      for (src <- sharedPaths if allResolvable) {
+        val (out, offset) = srcToOutput(src)
+        val readTimeDv =
+          readDeletionVectorOrEmpty(dvStore, currentRemoveByPath(src).deletionVector, tablePath)
+        if (!readTimeDv.isEmpty) {
+          // `F` already had a DV at read time -> the output orders its LIVE rows, so a deleted
+          // physical index is not `offset + i`. Not safely remappable here; leave to abort.
+          allResolvable = false
+        } else {
+          val winnerDv =
+            readDeletionVectorOrEmpty(dvStore, winningDvUpdates(src).deletionVector, tablePath)
+          val acc = outputDv.getOrElseUpdate(out.path,
+            readDeletionVectorOrEmpty(dvStore, out.deletionVector, tablePath).copy())
+          winnerDv.forEach(i => acc.add(i + offset))
+          resolvedSources += src
+        }
+      }
+
+      // Reconcile only if every conflicting source was remappable; a partial remap could leave an
+      // un-reconciled conflict, so otherwise leave everything to the standard checks (abort).
+      if (allResolvable && outputDv.nonEmpty) {
+        // Each compacted output gets the remapped/unioned DV.
+        val addReplacements: Map[String, AddFile] = taggedOutputs.iterator
+          .filter(a => outputDv.contains(a.path))
+          .map { a =>
+            val desc = writeMergedDeletionVector(dvStore, tablePath, outputDv(a.path))
+            a.path -> a.copy(deletionVector = desc).withoutTightBoundStats
+          }.toMap
+        // Re-point each resolved source's RemoveFile at the winner's post-image (path + winning
+        // DV). The OPTIMIZE read the pre-winner version, so its (path, no-DV) RemoveFile would not
+        // match the winner's now-live (path, DV) file and would leave it undeleted (files are
+        // identified by path AND deletion vector).
+        val removeReplacements: Map[String, RemoveFile] =
+          resolvedSources.iterator.map(src =>
+            src -> winningDvUpdates(src).removeWithTimestamp()).toMap
+
+        val newActions = currentTransactionInfo.actions.map {
+          case a: AddFile if addReplacements.contains(a.path) => addReplacements(a.path)
+          case r: RemoveFile if removeReplacements.contains(r.path) => removeReplacements(r.path)
+          case other => other
+        }
+        // The reconciled sources are no longer read/delete conflicts for the standard checks.
+        resolvedSources.foreach(rowLevelResolvedPaths += _)
+        val newReadFiles = currentTransactionInfo.readFiles
+          .filterNot(f => resolvedSources.contains(f.path))
+        currentTransactionInfo =
+          currentTransactionInfo.copy(actions = newActions, readFiles = newReadFiles)
+
+        recordDeltaEvent(
+          deltaLog,
+          opType = "delta.optimize.conflictReconciliation.remapped",
+          data = Map(
+            "winningCommitVersion" -> winningCommitVersion,
+            "resolvedSources" -> resolvedSources.size,
+            "outputsRemapped" -> addReplacements.size,
             "winningOperation" -> winningOperationName.getOrElse("UNKNOWN")))
       }
     }
