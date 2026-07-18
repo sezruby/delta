@@ -429,7 +429,10 @@ def normalizeColumnNamesInDataType(
   def normalizeColumnNames(
       deltaLog: DeltaLog,
       baseSchema: StructType,
-      data: Dataset[_]
+      data: Dataset[_],
+      // Extra top-level columns to pass through untouched (not resolved against the table schema),
+      // e.g. transient helper columns consumed by a write-stage operator and never persisted.
+      preserveExtraColumns: Set[String] = Set.empty
     ): DataFrame = {
     val dataSchema = data.schema
     val dataFields = explodeNestedFieldNames(dataSchema).toSet
@@ -438,9 +441,10 @@ def normalizeColumnNamesInDataType(
       data.toDF()
     } else {
       // Allow the same shortcut logic (as the above `if` stmt) if the only extra fields are CDC
-      // metadata fields.
+      // metadata fields or explicitly-preserved helper columns.
       val nonCdcFields = dataFields.filterNot { f =>
-        f == CDCReader.CDC_PARTITION_COL || f == CDCReader.CDC_TYPE_COLUMN_NAME
+        f == CDCReader.CDC_PARTITION_COL || f == CDCReader.CDC_TYPE_COLUMN_NAME ||
+          preserveExtraColumns.contains(f)
       }
       if (nonCdcFields.subsetOf(tableFields)) {
         return data.toDF()
@@ -462,6 +466,9 @@ def normalizeColumnNamesInDataType(
             case None if RowId.RowIdMetadataStructField.isRowIdColumn(field) =>
               (field.name, None)
             case None if RowCommitVersion.MetadataStructField.isRowCommitVersionColumn(field) =>
+              (field.name, None)
+            // A transient helper column passed through untouched (e.g. write-stage capture inputs).
+            case None if preserveExtraColumns.contains(field.name) =>
               (field.name, None)
             case None =>
               throw DeltaErrors.cannotResolveColumn(field.name, baseSchema)

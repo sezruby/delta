@@ -1306,16 +1306,19 @@ private[delta] class ConflictChecker(
 
   /**
    * Compaction OPTIMIZE vs a concurrent row-level DML. An OPTIMIZE that removed a source file `F`
-   * and rewrote it (order-preserving) into a compacted output `O` conflicts with a concurrent
-   * DELETE/UPDATE that added a deletion vector to `F`. Instead of aborting, remap the concurrent
-   * DV onto `O`: `F`'s rows occupy `O` at positions `[offset, offset + numRecords(F))` in write
-   * order (recorded in the [[AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION]] tag), so a deleted physical
-   * row `i` in `F` maps to `offset + i` in `O`, unioned into `O`'s deletion vector.
+   * and compacted it into an output `O` conflicts with a concurrent DELETE/UPDATE that added a
+   * deletion vector to `F`. Instead of aborting, remap the concurrent DV onto `O`: the compaction
+   * write observed, per source, the contiguous runs mapping `F`'s physical rows
+   * `[sourceStart, sourceStart + count)` to output positions `[outputStart, outputStart + count)`
+   * (recorded in the [[AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION]] tag as `[sourceFile, sourceStart,
+   * count]` entries in write order). A deleted physical row `i` in `F` therefore maps to
+   * `outputStart + (i - sourceStart)` in `O`, unioned into `O`'s deletion vector.
    *
-   * Conservative by design: only for tagged (order-preserving compaction) outputs, only when `F`
-   * carried no deletion vector at read time (otherwise the physical index is not the output rank),
-   * and only if every conflicting source is remappable; otherwise fall through to the standard
-   * checks (abort). Handles the direction where OPTIMIZE is the current (losing) transaction.
+   * Conservative by design: only for tagged (compaction) outputs, only when `F` carried no deletion
+   * vector at read time (otherwise the captured physical indices order `F`'s live rows), only if
+   * every deleted row falls in a captured run, and only if every conflicting source is remappable;
+   * otherwise fall through to the standard checks (abort). Handles the direction where OPTIMIZE is
+   * the current (losing) transaction.
    */
   private def resolveOptimizeConflicts(): Unit = {
     if (!optimizeReconciliationEnabled) return
@@ -1337,20 +1340,27 @@ private[delta] class ConflictChecker(
       case r: RemoveFile => r.path -> r
     }.toMap
 
-    // source file path -> (compacted output AddFile, offset of its rows within the output).
-    val srcToOutput = mutable.Map.empty[String, (AddFile, Long)]
+    // source file path -> the runs it contributed to a compacted output, each mapping a contiguous
+    // source physical-row range [sourceStart, sourceStart + count) to output positions
+    // [outputStart, outputStart + count). A source may contribute more than one run (e.g. a file
+    // split across read tasks), so runs are captured (SourceCompositionCaptureExec) rather than
+    // assumed. Tag entries are `[sourceFile, sourceStart, count]` in output order.
+    val srcToRuns = mutable.Map.empty[String, mutable.ArrayBuffer[(AddFile, Long, Long, Long)]]
     for (out <- taggedOutputs) {
       val composition = JsonUtils.fromJson[Seq[Seq[String]]](
         out.tag(AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION).get)
-      var offset = 0L
+      var outputPos = 0L
       for (entry <- composition) {
-        srcToOutput(entry.head) = (out, offset)
-        offset += entry(1).toLong
+        val sourceStart = entry(1).toLong
+        val count = entry(2).toLong
+        srcToRuns.getOrElseUpdate(entry.head, mutable.ArrayBuffer.empty) +=
+          ((out, sourceStart, count, outputPos))
+        outputPos += count
       }
     }
 
     val sharedPaths = winningDvUpdates.keySet
-      .intersect(srcToOutput.keySet)
+      .intersect(srcToRuns.keySet)
       .intersect(currentRemoveByPath.keySet)
     if (sharedPaths.isEmpty) return
 
@@ -1364,20 +1374,28 @@ private[delta] class ConflictChecker(
       var allResolvable = true
 
       for (src <- sharedPaths if allResolvable) {
-        val (out, offset) = srcToOutput(src)
         val readTimeDv =
           readDeletionVectorOrEmpty(dvStore, currentRemoveByPath(src).deletionVector, tablePath)
         if (!readTimeDv.isEmpty) {
-          // `F` already had a DV at read time -> the output orders its LIVE rows, so a deleted
-          // physical index is not `offset + i`. Not safely remappable here; leave to abort.
+          // `F` already had a DV at read time -> the captured physical row indices order its LIVE
+          // rows, so a deleted physical index need not land in a run. Not safely remappable; abort.
           allResolvable = false
         } else {
           val winnerDv =
             readDeletionVectorOrEmpty(dvStore, winningDvUpdates(src).deletionVector, tablePath)
-          val acc = outputDv.getOrElseUpdate(out.path,
-            readDeletionVectorOrEmpty(dvStore, out.deletionVector, tablePath).copy())
-          winnerDv.forEach(i => acc.add(i + offset))
-          resolvedSources += src
+          val runs = srcToRuns(src)
+          winnerDv.forEach { i =>
+            runs.find { case (_, start, count, _) => i >= start && i < start + count } match {
+              case Some((out, start, _, outputStart)) =>
+                val acc = outputDv.getOrElseUpdate(out.path,
+                  readDeletionVectorOrEmpty(dvStore, out.deletionVector, tablePath).copy())
+                acc.add(outputStart + (i - start))
+              case None =>
+                // A deleted physical row is not covered by any captured run -> cannot remap. Abort.
+                allResolvable = false
+            }
+          }
+          if (allResolvable) resolvedSources += src
         }
       }
 

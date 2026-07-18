@@ -105,9 +105,11 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
   protected def normalizeData(
       deltaLog: DeltaLog,
       options: Option[DeltaOptions],
-      data: DataFrame): (QueryExecution, Seq[Attribute], Seq[Constraint], Set[String]) = {
+      data: DataFrame,
+      preserveExtraColumns: Set[String] = Set.empty)
+    : (QueryExecution, Seq[Attribute], Seq[Constraint], Set[String]) = {
     val (normalizedSchema, output, constraints, trackHighWaterMarks) = normalizeSchema(
-      deltaLog, options, data)
+      deltaLog, options, data, preserveExtraColumns)
 
     (normalizedSchema.queryExecution, output, constraints, trackHighWaterMarks)
   }
@@ -126,9 +128,11 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
   protected def normalizeSchema(
       deltaLog: DeltaLog,
       options: Option[DeltaOptions],
-      data: DataFrame): (DataFrame, Seq[Attribute], Seq[Constraint], Set[String]) = {
+      data: DataFrame,
+      preserveExtraColumns: Set[String] = Set.empty)
+    : (DataFrame, Seq[Attribute], Seq[Constraint], Set[String]) = {
     val normalizedData = SchemaUtils.normalizeColumnNames(
-      deltaLog, metadata.schema, data
+      deltaLog, metadata.schema, data, preserveExtraColumns
     )
 
     // Validate that write columns for Row IDs have the correct name.
@@ -407,30 +411,41 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       inputData: Dataset[_],
       writeOptions: Option[DeltaOptions],
       isOptimize: Boolean,
-      additionalConstraints: Seq[Constraint]): Seq[FileAction] = {
+      additionalConstraints: Seq[Constraint],
+      // OPTIMIZE compaction conflict-reconciliation: when set, the input carries two transient
+      // helper columns that a [[SourceCompositionCaptureExec]] observes to record the output's
+      // source composition into this accumulator; the helpers are then projected away and never
+      // persisted (so everything downstream is driven by the table-column output).
+      sourceCompositionCapture: Option[SourceCompositionAccumulator] = None): Seq[FileAction] = {
     hasWritten = true
 
     val spark = inputData.sparkSession
     val (data, partitionSchema) = performCDCPartition(inputData)
     val outputPath = deltaLog.dataPath
 
+    val preserveExtraColumns =
+      if (sourceCompositionCapture.isDefined) SourceCompositionCaptureExec.captureColumns
+      else Set.empty[String]
     val (queryExecution, output, generatedColumnConstraints, trackFromData) =
-      normalizeData(deltaLog, writeOptions, data)
+      normalizeData(deltaLog, writeOptions, data, preserveExtraColumns)
+    // The persisted (table-column) output: in capture mode the two transient helper columns ride
+    // through `normalizeData` but must not drive stats / partitioning / the write schema.
+    val writeOutput = output.filterNot(a => preserveExtraColumns.contains(a.name))
     // Use the track set from the transaction if set,
     // otherwise use the track set from `normalizeData()`.
     val trackIdentityHighWaterMarks = trackHighWaterMarks.getOrElse(trackFromData)
 
-    val partitioningColumns = getPartitioningColumns(partitionSchema, output)
+    val partitioningColumns = getPartitioningColumns(partitionSchema, writeOutput)
 
     val committer = getCommitter(outputPath)
 
-    val (statsDataSchema, _) = getStatsSchema(output, partitionSchema)
+    val (statsDataSchema, _) = getStatsSchema(writeOutput, partitionSchema)
 
     // If Statistics Collection is enabled, then create a stats tracker that will be injected during
     // the FileFormatWriter.write call below and will collect per-file stats using
     // StatisticsCollection
-    val (optionalStatsTracker, _) = getOptionalStatsTrackerAndStatsCollection(output, outputPath,
-      partitionSchema, data)
+    val (optionalStatsTracker, _) = getOptionalStatsTrackerAndStatsCollection(
+      writeOutput, outputPath, partitionSchema, data)
 
 
     val constraints =
@@ -450,18 +465,31 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       val outputSpec = FileFormatWriter.OutputSpec(
         outputPath.toString,
         Map.empty,
-        output)
+        writeOutput)
 
       val empty2NullPlan = convertEmptyToNullIfNeeded(queryExecution.executedPlan,
         partitioningColumns, constraints)
       val checkInvariants = DeltaInvariantCheckerExec(spark, empty2NullPlan, constraints)
       // No need to plan optimized write if the write command is OPTIMIZE, which aims to produce
       // evenly-balanced data files already.
-      val physicalPlan = if (!isOptimize &&
+      val basePlan = if (!isOptimize &&
         shouldOptimizeWrite(writeOptions, spark.sessionState.conf)) {
         DeltaOptimizedWriterExec(checkInvariants, metadata.partitionColumns, deltaLog)
       } else {
         checkInvariants
+      }
+      // OPTIMIZE compaction conflict-reconciliation: observe the source composition and project the
+      // two transient helper columns away, so the writer sees only `writeOutput` (table columns).
+      val physicalPlan = sourceCompositionCapture match {
+        case Some(acc) =>
+          val childOut = basePlan.output
+          SourceCompositionCaptureExec(
+            basePlan,
+            writeOutput,
+            childOut.indexWhere(_.name == SourceCompositionCaptureExec.SOURCE_FILE_COL),
+            childOut.indexWhere(_.name == SourceCompositionCaptureExec.SOURCE_ROW_INDEX_COL),
+            acc)
+        case None => basePlan
       }
 
       val statsTrackers: ListBuffer[WriteJobStatsTracker] = ListBuffer()
