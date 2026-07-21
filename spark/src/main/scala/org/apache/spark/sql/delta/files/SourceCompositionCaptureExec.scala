@@ -18,24 +18,24 @@ package org.apache.spark.sql.delta.files
 
 import scala.collection.mutable
 
-import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.{InputFileBlockHolder, RDD}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.{AccumulatorV2, CompletionIterator}
 
 /** A contiguous run of rows from one source file, landing at consecutive positions in a
  *  compaction output. Rows `[startRowIndex, startRowIndex + count)` of `sourceFile` occupy the
- *  next `count` output positions in write order. */
+ *  next `count` output positions in write order. For a source file with no compaction-time
+ *  deletion vector this is one run with `startRowIndex = 0`; DV'd files are left unreconciled. */
 case class SourceRun(sourceFile: String, startRowIndex: Long, count: Long)
 
 object SourceCompositionCaptureExec {
-  /** Transient helper column carrying the source file path (`_metadata.file_path`). */
-  final val SOURCE_FILE_COL = "__source_file"
-  /** Transient helper column carrying the physical source row index (`_metadata.row_index`). */
-  final val SOURCE_ROW_INDEX_COL = "__source_row_index"
-  /** The transient helper columns observed by the capture and never persisted. */
-  val captureColumns: Set[String] = Set(SOURCE_FILE_COL, SOURCE_ROW_INDEX_COL)
+  /** No transient helper column is needed: the source file identity comes from
+   *  [[InputFileBlockHolder]] and the per-file row count is derived by counting output rows, so
+   *  nothing extra is materialized into the row and the writer sees a plain table-width row. */
+  val captureColumns: Set[String] = Set.empty
 }
 
 /**
@@ -75,56 +75,52 @@ class SourceCompositionAccumulator
 
 /**
  * A write-stage operator for OPTIMIZE compaction conflict-reconciliation, injected into the write
- * plan (like [[DeltaOptimizedWriterExec]]). Its `child` produces the table columns plus two
- * transient helper columns `__source_file` (`_metadata.file_path`, at `sourceFileOrdinal`) and
- * `__source_row_index` (`_metadata.row_index`, at `sourceRowIndexOrdinal`). As rows stream through
- * in the exact order they are written, it records the contiguous `(sourceFile, startRowIndex,
- * count)` runs via [[acc]] and emits each row **projected to just [[keptOutput]] (the table
- * columns)** so the helpers are observed but never persisted, and `output` is a clean table
- * schema for the writer/stats.
+ * plan (like [[DeltaOptimizedWriterExec]]). It records, per source file, how many rows that file
+ * contributed to the compaction output and in what order, with no per-row helper column.
  *
- * Runs flush to the accumulator on successful task completion (the writer consumed the whole
- * partition and committed); failed attempts flush nothing. Correct regardless of read order / file
- * splits, because it records what actually happened rather than assuming an order.
+ * The source file identity is read per row from [[InputFileBlockHolder]] (the scan's thread-local,
+ * the same one `input_file_name()` reads); a per-file counter tracks each file's row count. Rows
+ * are emitted unchanged: there is no extra column to strip (no row copy) and no
+ * `_metadata.row_index` materialization (which would drag in the DV-aware scan cost). On a
+ * contiguous coalesce read each file's rows land in one output segment, so `(sourceFile, count)` in
+ * write order fully describes the layout and the driver derives the physical offsets. Each run uses
+ * `startRowIndex = 0`, valid only when the source file had no compaction-time deletion vector; the
+ * driver tags only in that case and otherwise aborts.
+ *
+ * Runs flush to the accumulator on successful task completion; failed attempts flush nothing. The
+ * [[InputFileBlockHolder]] read is only valid when the scan and this operator run in the same task
+ * with no shuffle between them (the coalesce path, the default). On the repartition path the holder
+ * is empty after the shuffle, so no file is recorded and the loser aborts as it does today.
  */
 case class SourceCompositionCaptureExec(
     child: SparkPlan,
-    keptOutput: Seq[Attribute],
-    sourceFileOrdinal: Int,
-    sourceRowIndexOrdinal: Int,
     acc: SourceCompositionAccumulator) extends UnaryExecNode {
 
-  override def output: Seq[Attribute] = keptOutput
+  override def output: Seq[Attribute] = child.output
 
   override def doExecute(): RDD[InternalRow] = {
-    val childOutput = child.output
-    val kept = keptOutput
-    val sfOrd = sourceFileOrdinal
-    val riOrd = sourceRowIndexOrdinal
     val accumulator = acc
     child.execute().mapPartitions { iter =>
-      val project = UnsafeProjection.create(kept, childOutput)
       val runs = mutable.ArrayBuffer.empty[SourceRun]
-      var curFile: String = null
-      var curStart = 0L
+      var curFileUtf: UTF8String = null // holder instance for the current file (stable per file)
+      var curFile: String = null // materialized once per file boundary, not per row
       var curCount = 0L
-      var curNext = 0L // expected next source row index to continue the current run
-      def closeRun(): Unit = if (curCount > 0) runs += SourceRun(curFile, curStart, curCount)
+      def closeRun(): Unit = if (curCount > 0) runs += SourceRun(curFile, 0L, curCount)
 
       val mapped = iter.map { row =>
-        val sf = if (row.isNullAt(sfOrd)) null else row.getUTF8String(sfOrd).toString
-        val ri = if (row.isNullAt(riOrd)) -1L else row.getLong(riOrd)
-        if (sf != null && sf == curFile && ri == curNext) {
+        // File identity from the scan's thread-local; the holder returns a stable UTF8String per
+        // file, so `eq` fast-paths the same-file hot path and we only call toString at a boundary.
+        val sfUtf = InputFileBlockHolder.getInputFilePath
+        val sameFile = (sfUtf eq curFileUtf) || (sfUtf != null && sfUtf.equals(curFileUtf))
+        if (sameFile) {
           curCount += 1
-          curNext += 1
         } else {
           closeRun()
-          curFile = sf
-          curStart = ri
+          curFileUtf = sfUtf
+          curFile = if (sfUtf == null || sfUtf.numBytes() == 0) null else sfUtf.toString
           curCount = 1
-          curNext = ri + 1
         }
-        project(row)
+        row // pass through unchanged; no helper column exists to strip
       }
       // Flush the observed runs once the writer has consumed the whole partition. Using
       // CompletionIterator (rather than a task-completion listener) runs the flush inside the task

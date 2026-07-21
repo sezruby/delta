@@ -20,6 +20,7 @@ import java.io.File
 
 import scala.concurrent.duration.Duration
 
+import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.concurrency.{PhaseLockingTestMixin, TransactionExecutionTestMixin}
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
@@ -67,6 +68,11 @@ class OptimizeConflictReconciliationSuite extends QueryTest
       Array.empty[Row]
     }
 
+  /** Whether any active file carries the source-composition tag (i.e. reconciliation can engage). */
+  private def hasCompositionTag(log: DeltaLog): Boolean =
+    log.update().allFiles.collect()
+      .exists(_.tag(AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION).isDefined)
+
   private def ids(dir: File): Seq[Long] =
     spark.read.format("delta").load(dir.getAbsolutePath).select("id")
       .collect().map(_.getLong(0)).sorted.toSeq
@@ -91,12 +97,107 @@ class OptimizeConflictReconciliationSuite extends QueryTest
 
       // Both committed, correct data: id=150 gone, everything else present.
       assert(ids(dir) === (0L until 300L).filterNot(_ == 150L))
-      // Compacted to a single output file that carries the remapped deletion vector (cardinality 1),
-      // proving reconciliation (a plain re-compaction retry would leave no DV on the output).
+      // Compacted to one output file carrying the remapped deletion vector (cardinality 1), proving
+      // reconciliation (a plain re-compaction retry would leave no DV on the output).
       val files = log.update().allFiles.collect()
       assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
       assert(deletionVectorCardinalities(log) === Seq(1L),
         "compacted output should carry the remapped deletion vector")
+    }
+  }
+
+  test("compaction OPTIMIZE (loser) reconciles a concurrent DELETE when a source already has a DV") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // Pre-existing (compaction-time) DV: delete id=100 (physical row 0 of the middle file). This
+      // commits before OPTIMIZE reads, so that file's live rows start at physical index 1 and the
+      // driver must split the run around the gap.
+      sql(s"DELETE FROM ${tableRef(dir)} WHERE id = 100")
+      assert(deletionVectorCardinalities(log) === Seq(1L), "pre-existing DV expected on one file")
+
+      // A (loser): OPTIMIZE compacts all files (purging the pre-existing DV). B (winner): DELETE
+      // id=150 commits during A, giving the middle file a cumulative DV {id100, id150}. A must remap
+      // only B's NEW deletion (id150) onto the output, accounting for the read-time gap from id100.
+      val txnA = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = true)
+      val txnB = sqlTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150", reconcile = true)
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnA, txnB)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      ThreadUtils.awaitResult(futureA, Duration.Inf)
+
+      // Both committed, correct data: id=100 and id=150 gone, everything else present.
+      assert(ids(dir) === (0L until 300L).filterNot(x => x == 100L || x == 150L))
+      // Compacted to one output file whose DV carries only the newly-deleted id=150 (cardinality 1);
+      // id=100 was already excluded from the output, so it is not in the remapped DV.
+      val files = log.update().allFiles.collect()
+      assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
+      assert(deletionVectorCardinalities(log) === Seq(1L),
+        "compacted output should carry the remapped DV for the new delete only")
+    }
+  }
+
+  test("reconciliation remaps a delete to a non-DV file in a bin that also holds a DV'd file") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // Pre-existing DV on the middle file (id=100) drops its live count to 99, which must shift the
+      // LAST file's output offset. A concurrent delete of id=250 (last file, no DV) then has to land
+      // at the correctly-shifted offset (199+50, not 200+50) — catches an off-by-one in the
+      // cumulative offset if the driver used physical instead of live counts for the DV'd file.
+      sql(s"DELETE FROM ${tableRef(dir)} WHERE id = 100")
+      val txnA = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = true)
+      val txnB = sqlTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 250", reconcile = true)
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnA, txnB)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      ThreadUtils.awaitResult(futureA, Duration.Inf)
+
+      assert(ids(dir) === (0L until 300L).filterNot(x => x == 100L || x == 250L))
+      val files = log.update().allFiles.collect()
+      assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
+      assert(deletionVectorCardinalities(log) === Seq(1L),
+        "compacted output DV should carry only the concurrent delete of id=250")
+    }
+  }
+
+  // The reconcile guard is "no composition tag => resolveOptimizeConflicts cannot engage => the
+  // loser falls through to the standard conflict checks (abort)". We assert the tag is present for
+  // compaction and absent for the excluded layout ops, rather than drive those through the
+  // phase-locking harness (a clustering/repartition write has a different phase structure that the
+  // A_Start__B__A_End observer can't sequence). The abort itself is covered by OptimizeConflictSuite.
+
+  test("plain compaction OPTIMIZE tags its output when reconciliation is enabled") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true") {
+        sql(s"OPTIMIZE ${tableRef(dir)}").collect()
+      }
+      assert(hasCompositionTag(log), "compaction should tag its output so reconciliation can engage")
+    }
+  }
+
+  test("ZORDER (clustering) OPTIMIZE produces no composition tag; reconciliation cannot engage") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // A clustering pass permutes rows, so no offset mapping exists: it must not tag its output.
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true") {
+        sql(s"OPTIMIZE ${tableRef(dir)} ZORDER BY (id)").collect()
+      }
+      assert(!hasCompositionTag(log), "a clustering OPTIMIZE must not tag its output")
+    }
+  }
+
+  test("repartition-path OPTIMIZE produces no composition tag; reconciliation cannot engage") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // repartition(1) shuffles rows, breaking the contiguity the offset replay relies on.
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_REPARTITION_ENABLED.key -> "true") {
+        sql(s"OPTIMIZE ${tableRef(dir)}").collect()
+      }
+      assert(!hasCompositionTag(log), "the repartition path must not tag its output")
     }
   }
 }

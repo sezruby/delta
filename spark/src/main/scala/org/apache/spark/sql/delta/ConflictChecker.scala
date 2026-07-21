@@ -1314,11 +1314,12 @@ private[delta] class ConflictChecker(
    * count]` entries in write order). A deleted physical row `i` in `F` therefore maps to
    * `outputStart + (i - sourceStart)` in `O`, unioned into `O`'s deletion vector.
    *
-   * Conservative by design: only for tagged (compaction) outputs, only when `F` carried no deletion
-   * vector at read time (otherwise the captured physical indices order `F`'s live rows), only if
-   * every deleted row falls in a captured run, and only if every conflicting source is remappable;
-   * otherwise fall through to the standard checks (abort). Handles the direction where OPTIMIZE is
-   * the current (losing) transaction.
+   * Conservative by design: only for tagged (compaction) outputs, only if every newly-deleted row
+   * falls in a captured run, and only if every conflicting source is remappable; otherwise fall
+   * through to the standard checks (abort). If `F` carried a deletion vector at read time, its
+   * runs cover only its live rows (the driver split them around the read-time gaps) and only the
+   * winner's incremental deletions are remapped. Handles the direction where OPTIMIZE is the
+   * current (losing) transaction.
    */
   private def resolveOptimizeConflicts(): Unit = {
     if (!optimizeReconciliationEnabled) return
@@ -1374,29 +1375,30 @@ private[delta] class ConflictChecker(
       var allResolvable = true
 
       for (src <- sharedPaths if allResolvable) {
+        // `F`'s deletion vector when OPTIMIZE read it. If non-empty, those rows were already gone
+        // from the compacted output, so the captured runs describe only `F`'s live rows (split into
+        // contiguous physical segments around the read-time gaps by the driver).
         val readTimeDv =
           readDeletionVectorOrEmpty(dvStore, currentRemoveByPath(src).deletionVector, tablePath)
-        if (!readTimeDv.isEmpty) {
-          // `F` already had a DV at read time -> the captured physical row indices order its LIVE
-          // rows, so a deleted physical index need not land in a run. Not safely remappable; abort.
-          allResolvable = false
-        } else {
-          val winnerDv =
-            readDeletionVectorOrEmpty(dvStore, winningDvUpdates(src).deletionVector, tablePath)
-          val runs = srcToRuns(src)
-          winnerDv.forEach { i =>
+        val winnerDv =
+          readDeletionVectorOrEmpty(dvStore, winningDvUpdates(src).deletionVector, tablePath)
+        val runs = srcToRuns(src)
+        winnerDv.forEach { i =>
+          // The winner's DV is cumulative. Rows already deleted at read time are not in the output,
+          // so remap only the winner's NEW deletions; each lands in a live-row run.
+          if (!readTimeDv.contains(i)) {
             runs.find { case (_, start, count, _) => i >= start && i < start + count } match {
               case Some((out, start, _, outputStart)) =>
                 val acc = outputDv.getOrElseUpdate(out.path,
                   readDeletionVectorOrEmpty(dvStore, out.deletionVector, tablePath).copy())
                 acc.add(outputStart + (i - start))
               case None =>
-                // A deleted physical row is not covered by any captured run -> cannot remap. Abort.
+                // A newly-deleted physical row is not covered by any captured run -> cannot remap.
                 allResolvable = false
             }
           }
-          if (allResolvable) resolvedSources += src
         }
+        if (allResolvable) resolvedSources += src
       }
 
       // Reconcile only if every conflicting source was remappable; a partial remap could leave an

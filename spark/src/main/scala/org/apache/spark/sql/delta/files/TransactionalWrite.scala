@@ -412,10 +412,9 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       writeOptions: Option[DeltaOptions],
       isOptimize: Boolean,
       additionalConstraints: Seq[Constraint],
-      // OPTIMIZE compaction conflict-reconciliation: when set, the input carries two transient
-      // helper columns that a [[SourceCompositionCaptureExec]] observes to record the output's
-      // source composition into this accumulator; the helpers are then projected away and never
-      // persisted (so everything downstream is driven by the table-column output).
+      // OPTIMIZE compaction conflict-reconciliation: when set, a SourceCompositionCaptureExec is
+      // injected to observe the output's source composition (file identity + per-file row count)
+      // into this accumulator. No helper columns are added; rows pass through unchanged.
       sourceCompositionCapture: Option[SourceCompositionAccumulator] = None): Seq[FileAction] = {
     hasWritten = true
 
@@ -428,8 +427,8 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       else Set.empty[String]
     val (queryExecution, output, generatedColumnConstraints, trackFromData) =
       normalizeData(deltaLog, writeOptions, data, preserveExtraColumns)
-    // The persisted (table-column) output: in capture mode the two transient helper columns ride
-    // through `normalizeData` but must not drive stats / partitioning / the write schema.
+    // Capture mode adds no helper columns (`preserveExtraColumns` is empty), so this is just
+    // `output`; the filter is kept for generality if a future helper column is reintroduced.
     val writeOutput = output.filterNot(a => preserveExtraColumns.contains(a.name))
     // Use the track set from the transaction if set,
     // otherwise use the track set from `normalizeData()`.
@@ -478,17 +477,11 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       } else {
         checkInvariants
       }
-      // OPTIMIZE compaction conflict-reconciliation: observe the source composition and project the
-      // two transient helper columns away, so the writer sees only `writeOutput` (table columns).
+      // OPTIMIZE compaction conflict-reconciliation: observe the source composition (file identity
+      // from InputFileBlockHolder + per-file row count) while rows pass through unchanged. No
+      // helper column to strip; the driver derives physical offsets from the per-file counts.
       val physicalPlan = sourceCompositionCapture match {
-        case Some(acc) =>
-          val childOut = basePlan.output
-          SourceCompositionCaptureExec(
-            basePlan,
-            writeOutput,
-            childOut.indexWhere(_.name == SourceCompositionCaptureExec.SOURCE_FILE_COL),
-            childOut.indexWhere(_.name == SourceCompositionCaptureExec.SOURCE_ROW_INDEX_COL),
-            acc)
+        case Some(acc) => SourceCompositionCaptureExec(basePlan, acc)
         case None => basePlan
       }
 
