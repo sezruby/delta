@@ -26,11 +26,12 @@ import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.DeltaOperations.Operation
 import org.apache.spark.sql.delta.actions.{Action, AddFile, DeletionVectorDescriptor, FileAction, RemoveFile}
 import org.apache.spark.sql.delta.commands.optimize._
-import org.apache.spark.sql.delta.files.SQLMetricsReporting
+import org.apache.spark.sql.delta.files.{SourceCompositionAccumulator, SourceCompositionCaptureExec, SQLMetricsReporting}
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.schema.{SchemaUtils, UnsupportedDataTypeInfo}
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
-import org.apache.spark.sql.delta.util.BinPackingUtils
+import org.apache.spark.sql.delta.storage.dv.DeletionVectorStore
+import org.apache.spark.sql.delta.util.{BinPackingUtils, DeltaFileOperations, JsonUtils}
 
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext.SPARK_JOB_GROUP_ID
@@ -519,9 +520,31 @@ class OptimizeExecutor(
       bin: Seq[AddFile],
       maxFileSize: Long): Seq[FileAction] = {
     val baseTablePath = txn.deltaLog.dataPath
+    // Compaction conflict-reconciliation (optimize.conflictReconciliation.enabled): observe the
+    // source composition of the compacted output at write time (SourceCompositionCaptureExec) so a
+    // concurrent DML's deletion vector can be remapped onto it instead of aborting. Compaction
+    // only, never clustering (a clustering pass permutes rows, so no offset mapping exists).
+    val reconcileEnabled = sparkSession.sessionState.conf
+      .getConf(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED)
+    val useRepartition = sparkSession.sessionState.conf
+      .getConf(DeltaSQLConf.DELTA_OPTIMIZE_REPARTITION_ENABLED)
+    // Reconciliation derives contiguous row-range offsets from the compaction output, which hold
+    // only on the coalesce path (repartition shuffles rows, breaking contiguity) and only for
+    // compaction (a clustering pass permutes rows, so no offset mapping exists).
+    val captureReconcile = reconcileEnabled && !isMultiDimClustering && !useRepartition
 
     var input = txn.deltaLog.createDataFrame(txn.snapshot, bin, actionTypeOpt = Some("Optimize"))
     input = RowTracking.preserveRowTrackingColumns(input, txn.snapshot)
+
+    val captureAccOpt: Option[SourceCompositionAccumulator] =
+      if (captureReconcile) {
+        val acc = new SourceCompositionAccumulator
+        sparkSession.sparkContext.register(acc)
+        Some(acc)
+      } else {
+        None
+      }
+
     val repartitionDF = if (isMultiDimClustering) {
       val totalSize = bin.map(_.size).sum
       val approxNumFiles = Math.max(1, totalSize / maxFileSize).toInt
@@ -531,13 +554,11 @@ class OptimizeExecutor(
         clusteringColumns,
         optimizeStrategy.curve)
     } else {
-      val useRepartition = sparkSession.sessionState.conf.getConf(
-        DeltaSQLConf.DELTA_OPTIMIZE_REPARTITION_ENABLED)
-      if (useRepartition) {
-        input.repartition(numPartitions = 1)
-      } else {
-        input.coalesce(numPartitions = 1)
-      }
+      // No sort and no helper column: SourceCompositionCaptureExec observes the source composition
+      // (file identity from InputFileBlockHolder + a per-file row count) during the write. The
+      // layout is observed, not imposed.
+      if (useRepartition) input.repartition(numPartitions = 1)
+      else input.coalesce(numPartitions = 1)
     }
 
     val partitionDesc = partition.toSeq.map(entry => entry._1 + "=" + entry._2).mkString(",")
@@ -549,7 +570,8 @@ class OptimizeExecutor(
       description)
 
     val binInfo = optimizeStrategy.initNewBin
-    val addFiles = txn.writeFiles(repartitionDF, None, isOptimize = true, Nil).collect {
+    val addFiles = txn.writeFiles(repartitionDF, None, isOptimize = true, Nil,
+        sourceCompositionCapture = captureAccOpt).collect {
       case a: AddFile => optimizeStrategy.tagAddFile(a, binInfo)
       case other =>
         throw new IllegalStateException(
@@ -557,7 +579,67 @@ class OptimizeExecutor(
               s"should only have AddFiles")
     }
     val removeFiles = bin.map(f => f.removeWithTimestamp(operationTimestamp, dataChange = false))
-    val updates = addFiles ++ removeFiles
+    // Tag the single compacted output with the observed source composition so the conflict checker
+    // can remap a concurrent DML deletion vector by offset. Only when exactly one output file was
+    // produced by exactly one write partition and each source file contributed exactly one captured
+    // run covering the whole bin (a sanity gate against retries / speculation / splits); otherwise
+    // leave untagged so the loser aborts as it does today. A source file that had a compaction-time
+    // DV contributed only its live rows, so its single captured run is expanded here (from the DV
+    // bitmap) into one run per contiguous live segment, carrying the real physical startRowIndex.
+    val outputAddFiles = captureAccOpt match {
+      case Some(acc) if addFiles.size == 1 && acc.value.size() == 1 &&
+          bin.forall(_.numLogicalRecords.isDefined) =>
+        val runs = acc.value.get(0)
+        val captured = (0 until runs.size()).map(runs.get(_).count).sum
+        val expected = bin.flatMap(_.numLogicalRecords).sum
+        // Map each run's absolute source path (from the holder) back to the table-relative AddFile
+        // path, so the recorded composition keys match the winning DV updates / RemoveFiles (both
+        // relative) at conflict-resolution time.
+        val nameToAddFile = generateCandidateFileMap(txn.deltaLog.dataPath, bin)
+        val tablePath = txn.deltaLog.dataPath
+        // scalastyle:off deltahadoopconfiguration
+        val dvStore = DeletionVectorStore.createInstance(txn.deltaLog.newDeltaHadoopConf())
+        // scalastyle:on deltahadoopconfiguration
+        // Expand each captured (source, liveCount) run into output-ordered `[relPath, start,
+        // count]` entries. No DV -> one run `[0, liveCount)`. Compaction-time DV -> the live rows
+        // are physical `[0, liveCount + dvCardinality)` minus the deleted positions, split into
+        // contiguous segments so a later concurrent delete remaps to the right output offset.
+        val perFile: Seq[Option[Seq[Seq[String]]]] = (0 until runs.size()).map { i =>
+          val r = runs.get(i)
+          val abs = DeltaFileOperations.absolutePath(tablePath.toString, r.sourceFile).toString
+          nameToAddFile.get(abs).map { add =>
+            if (add.deletionVector == null) {
+              Seq(Seq(add.path, "0", r.count.toString))
+            } else {
+              val deleted = dvStore.read(add.deletionVector, tablePath).values.sorted
+              val physicalCount = r.count + add.deletionVector.cardinality
+              val segs = ArrayBuffer.empty[Seq[String]]
+              var start = 0L
+              deleted.foreach { d =>
+                if (d > start) segs += Seq(add.path, start.toString, (d - start).toString)
+                start = d + 1
+              }
+              if (physicalCount > start) {
+                segs += Seq(add.path, start.toString, (physicalCount - start).toString)
+              }
+              segs.toSeq
+            }
+          }
+        }
+        // Each source file mapped and produced exactly one captured run covering the whole bin.
+        val oneRunPerFile = runs.size() == bin.size &&
+          (0 until runs.size()).map(runs.get(_).sourceFile).distinct.size == bin.size
+        if (captured == expected && perFile.forall(_.isDefined) && oneRunPerFile) {
+          val relRuns = perFile.flatMap(_.get)
+          addFiles.map(_.copyWithTag(
+            AddFile.Tags.OPTIMIZE_SOURCE_COMPOSITION, JsonUtils.toJson(relRuns)))
+        } else {
+          addFiles
+        }
+      case _ =>
+        addFiles
+    }
+    val updates = outputAddFiles ++ removeFiles
     updates
   }
 

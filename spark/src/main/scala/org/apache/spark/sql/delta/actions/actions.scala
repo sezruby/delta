@@ -1116,6 +1116,16 @@ object AddFile {
     /** [[OPTIMIZE_TARGET_SIZE]]: target file size the file was optimized to. */
     object OPTIMIZE_TARGET_SIZE extends AddFile.Tags.KeyType("OPTIMIZE_TARGET_SIZE")
 
+    /**
+     * [[OPTIMIZE_SOURCE_COMPOSITION]]: for a compaction OPTIMIZE output file, a JSON array of
+     * `[sourcePath, numLogicalRecords]` pairs in write order. Used by the conflict checker to
+     * remap a concurrent deletion vector from a removed source file onto this compacted output
+     * (offset = cumulative numLogicalRecords of earlier sources). Written only when
+     * `optimize.conflictReconciliation.enabled` is set.
+     */
+    object OPTIMIZE_SOURCE_COMPOSITION
+      extends AddFile.Tags.KeyType("OPTIMIZE_SOURCE_COMPOSITION")
+
 
     /** [[ICEBERG_COMPAT_VERSION]]: IcebergCompat version */
     object ICEBERG_COMPAT_VERSION extends AddFile.Tags.KeyType("ICEBERG_COMPAT_VERSION")

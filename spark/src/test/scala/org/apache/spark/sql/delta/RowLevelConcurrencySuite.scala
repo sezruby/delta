@@ -138,7 +138,7 @@ class RowLevelConcurrencySuite extends QueryTest
       ThreadUtils.awaitResult(futureB, Duration.Inf)
       val e = intercept[SparkException] { ThreadUtils.awaitResult(futureA, Duration.Inf) }
       assertConcurrentModificationException(e)
-      // Only the winner's delete (id=20) is applied; DVs are still used, so its DV has cardinality 1.
+      // Only the winner's delete (id=20) is applied; DVs still used, so its DV has cardinality 1.
       assert(ids(dir) === (0L to 99L).filterNot(_ == 20))
       assert(deletionVectorCardinalities(log) === Seq(1L))
     }
