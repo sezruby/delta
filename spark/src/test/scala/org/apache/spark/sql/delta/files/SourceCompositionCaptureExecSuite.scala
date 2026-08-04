@@ -109,14 +109,18 @@ class SourceCompositionCaptureExecSuite extends QueryTest with DeltaSQLCommandTe
       assert(rowGroups.size == 2 && rowGroups.forall(_ > 1),
         s"expected two multi-row-group sources, got $rowGroups")
 
-      // A hostile ambient split size (512 bytes) breaks each multi-row-group source into many
-      // per-row-group splits before the read. The capture path pins the read against exactly this
-      // -- it clones the session and sets maxPartitionBytes to the compaction target and
-      // minPartitionNum = 1, so each source is read whole in one partition rather than as scattered
-      // splits -- and the tags below still come out contiguous per source.
+      // A hostile ambient split size: 8 KiB is smaller than either source (~11.6 KiB / ~17.6 KiB),
+      // so each is broken into a full split plus a row-bearing remainder. Under coalesce(1)'s
+      // descending-length split packing that remainder is read after the other source's head, so
+      // WITHOUT the pins the two sources interleave -- each would surface to the capture as more
+      // than one run, the one-run-per-file gate would decline, and the tags asserted below would be
+      // absent. The capture path pins the read against exactly this: it clones the session and sets
+      // maxPartitionBytes to the compaction target (>= every source) and minPartitionNum = 1, so
+      // each source reads whole in one partition and its row groups fold into one contiguous run.
+      // Drop the pins in readCompactionSourceWithWholeFilePins and this test fails.
       withSQLConf(
           DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true",
-          SQLConf.FILES_MAX_PARTITION_BYTES.key -> "512") {
+          SQLConf.FILES_MAX_PARTITION_BYTES.key -> "8192") {
         sql(s"OPTIMIZE delta.`$path`")
       }
 
@@ -204,6 +208,63 @@ class SourceCompositionCaptureExecSuite extends QueryTest with DeltaSQLCommandTe
       assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTION_INFO).isEmpty),
         "the repartition path must not record where sources landed -- rows were shuffled")
       checkAnswer(spark.read.format("delta").load(path), (0 until 4000).map(i => Row(i.toLong)))
+    }
+  }
+
+  test("ZORDER OPTIMIZE writes no composition tags (rows are z-ordered, not contiguous)") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(0, 2000).repartition(1).write.format("delta").mode("append").save(path)
+      spark.range(2000, 4000).repartition(1).write.format("delta").mode("append").save(path)
+
+      // A ZORDER pass reorders rows onto a space-filling curve, so no source keeps a contiguous
+      // row range and an offset composition would be meaningless. The capture gate excludes the
+      // multi-dimensional-clustering path, so the sources must be removed with plain untagged
+      // tombstones.
+      withSQLConf(
+          DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true",
+          DeltaSQLConf.DELTA_OPTIMIZE_ZORDER_COL_STAT_CHECK.key -> "false") {
+        sql(s"OPTIMIZE delta.`$path` ZORDER BY (id)")
+      }
+
+      val actions = optimizeCommitActions(path)
+      val removes = actions.collect { case r: RemoveFile => r }
+      assert(actions.exists(_.isInstanceOf[AddFile]) && removes.nonEmpty,
+        "the z-order must rewrite files")
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTED_INTO).isEmpty),
+        "z-order must not record a row-range composition -- rows were permuted")
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTION_INFO).isEmpty),
+        "z-order must not record a row-range composition -- rows were permuted")
+      checkAnswer(spark.read.format("delta").load(path), (0 until 4000).map(i => Row(i.toLong)))
+    }
+  }
+
+  test("CLUSTER BY OPTIMIZE writes no composition tags (clustering permutes rows)") {
+    withTable("clustered_optimize_src") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        sql(s"CREATE TABLE clustered_optimize_src (id LONG) USING delta " +
+          s"CLUSTER BY (id) LOCATION '$path'")
+        sql("INSERT INTO clustered_optimize_src SELECT id FROM range(0, 2000)")
+        sql("INSERT INTO clustered_optimize_src SELECT id FROM range(2000, 4000)")
+
+        // A clustering pass reorders rows into ZCubes, so no source keeps a contiguous row range.
+        // Same gate as ZORDER (isMultiDimClustering): the sources must be removed with plain
+        // untagged tombstones.
+        withSQLConf(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true") {
+          sql("OPTIMIZE clustered_optimize_src")
+        }
+
+        val actions = optimizeCommitActions(path)
+        val removes = actions.collect { case r: RemoveFile => r }
+        assert(actions.exists(_.isInstanceOf[AddFile]) && removes.nonEmpty,
+          "the clustering pass must rewrite files")
+        assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTED_INTO).isEmpty),
+          "clustering must not record a row-range composition -- rows were permuted")
+        assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTION_INFO).isEmpty),
+          "clustering must not record a row-range composition -- rows were permuted")
+        checkAnswer(spark.table("clustered_optimize_src"), (0 until 4000).map(i => Row(i.toLong)))
+      }
     }
   }
 
