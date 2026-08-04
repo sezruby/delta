@@ -36,7 +36,7 @@ import org.apache.spark.sql.delta.util.{BinPackingUtils, DeltaFileOperations, Js
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext.SPARK_JOB_GROUP_ID
 import org.apache.spark.internal.MDC
-import org.apache.spark.sql.{AnalysisException, Encoders, Row, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Encoders, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedTable}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression}
@@ -536,29 +536,11 @@ class OptimizeExecutor(
     val captureReconcile =
       reconcileEnabled && !isMultiDimClustering && !useRepartition
 
-    // When capturing the source composition (coalesce compaction path), read each source file
-    // whole so no source is split across partitions -- coalesce(1) then lands each source as one
-    // contiguous run, which is what the capture's one-run-per-file gate needs. Spark has no
-    // "do not split" toggle for Parquet; splitting is governed by
-    //   maxSplitBytes = min(maxPartitionBytes, max(openCostInBytes, totalBytes / minPartitionNum))
-    // so pin BOTH maxPartitionBytes (>= the compaction target) and minPartitionNum = 1: then
-    // maxSplitBytes >= every source (each <= the target), so no source splits. (A split that still
-    // somehow slips through just fails the gate and aborts -- never wrong data.) Both confs go on a
-    // CLONED session so the override is isolated from other queries sharing this SparkSession:
-    // createDataFrame binds the scan relation to SparkSession.active and Spark reads these confs
-    // from the captured session, so the clone need only be active while the relation is built,
-    // then we restore the previous active session.
+    // Read the bin. The reconcile-capture path pins the read so each source file lands whole in
+    // one contiguous run (see readCompactionSourceWithWholeFilePins); vanilla OPTIMIZE just reads
+    // on the current session.
     var input = if (captureReconcile) {
-      val readSession = sparkSession.cloneSession()
-      readSession.conf.set(SQLConf.FILES_MAX_PARTITION_BYTES.key, maxFileSize)
-      readSession.conf.set(SQLConf.FILES_MIN_PARTITION_NUM.key, "1")
-      val prevActive = SparkSession.getActiveSession
-      SparkSession.setActiveSession(readSession)
-      try {
-        txn.deltaLog.createDataFrame(txn.snapshot, bin, actionTypeOpt = Some("Optimize"))
-      } finally {
-        prevActive.fold(SparkSession.clearActiveSession())(SparkSession.setActiveSession)
-      }
+      readCompactionSourceWithWholeFilePins(txn, bin, maxFileSize)
     } else {
       txn.deltaLog.createDataFrame(txn.snapshot, bin, actionTypeOpt = Some("Optimize"))
     }
@@ -582,8 +564,11 @@ class OptimizeExecutor(
         clusteringColumns,
         optimizeStrategy.curve)
     } else {
-      if (useRepartition) input.repartition(numPartitions = 1)
-      else input.coalesce(numPartitions = 1)
+      if (useRepartition) {
+        input.repartition(numPartitions = 1)
+      } else {
+        input.coalesce(numPartitions = 1)
+      }
     }
 
     val partitionDesc = partition.toSeq.map(entry => entry._1 + "=" + entry._2).mkString(",")
@@ -603,14 +588,51 @@ class OptimizeExecutor(
           s"Unexpected action $other with type ${other.getClass}. File compaction job output" +
               s"should only have AddFiles")
     }
-    // Build the removed-source tombstones, tagging each with where its rows landed in the compacted
-    // output when reconciliation is enabled and the capture is trustworthy, so the conflict checker
-    // can remap a concurrent DML deletion vector by offset instead of aborting; otherwise plain
-    // untagged tombstones as vanilla OPTIMIZE writes (see the helper below).
-    val removeFiles = buildRemoveFilesWithCompactionCompositionTags(
-      txn, bin, addFiles, captureAccOpt, operationTimestamp)
+    // Tombstones for the removed sources. Only the RLC reconciliation path tags each source with
+    // where its rows landed in the compacted output (so a concurrent DML's DV can be remapped by
+    // offset instead of aborting); vanilla OPTIMIZE uses plain untagged tombstones and skips the
+    // reconcile helper entirely.
+    val removeFiles = if (captureReconcile) {
+      buildRemoveFilesWithCompactionCompositionTags(
+        txn, bin, addFiles, captureAccOpt, operationTimestamp)
+    } else {
+      bin.map(_.removeWithTimestamp(operationTimestamp, dataChange = false))
+    }
     val updates = addFiles ++ removeFiles
     updates
+  }
+
+  /**
+   * Read `bin` for a compaction OPTIMIZE on the reconciliation-capture path, pinning the read so
+   * each source file lands whole in a single partition.
+   *
+   * Each source file must be read whole so no source is split across partitions -- coalesce(1)
+   * then lands each source as one contiguous run, which is what the capture's one-run-per-file
+   * gate needs. Spark has no "do not split" toggle for Parquet; splitting is governed by
+   *   maxSplitBytes = min(maxPartitionBytes, max(openCostInBytes, totalBytes / minPartitionNum))
+   * so pin BOTH maxPartitionBytes (>= the compaction target) and minPartitionNum = 1: then
+   * maxSplitBytes >= every source (each <= the target), so no source splits. (A split that still
+   * somehow slips through just fails the capture gate and aborts -- never wrong data.) Both confs
+   * go on a CLONED session so the override is isolated from other queries -- and from the other
+   * bins compacting concurrently -- that share this SparkSession: createDataFrame binds the scan
+   * relation to SparkSession.active and Spark reads these confs from the captured session, so the
+   * clone need only be active while the relation is built, then the previous active session is
+   * restored.
+   */
+  private def readCompactionSourceWithWholeFilePins(
+      txn: OptimisticTransaction,
+      bin: Seq[AddFile],
+      maxFileSize: Long): DataFrame = {
+    val readSession = sparkSession.cloneSession()
+    readSession.conf.set(SQLConf.FILES_MAX_PARTITION_BYTES.key, maxFileSize)
+    readSession.conf.set(SQLConf.FILES_MIN_PARTITION_NUM.key, "1")
+    val prevActive = SparkSession.getActiveSession
+    SparkSession.setActiveSession(readSession)
+    try {
+      txn.deltaLog.createDataFrame(txn.snapshot, bin, actionTypeOpt = Some("Optimize"))
+    } finally {
+      prevActive.fold(SparkSession.clearActiveSession())(SparkSession.setActiveSession)
+    }
   }
 
   /**

@@ -16,25 +16,40 @@
 
 package org.apache.spark.sql.delta.files
 
+import java.io.File
+
 import scala.jdk.CollectionConverters._
 
+import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.actions.{Action, AddFile, CompactionInfoEntry, RemoveFile}
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
+import org.apache.spark.sql.delta.util.JsonUtils
+import org.apache.hadoop.fs.Path
+import org.apache.parquet.hadoop.ParquetFileReader
+import org.apache.parquet.hadoop.util.HadoopInputFile
+
 import org.apache.spark.rdd.{InputFileBlockHolder, RDD}
-import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.execution.LeafExecNode
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
-import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
- * Unit tests for [[SourceCompositionCaptureExec]]'s columnar execution path. The row path is
- * covered end to end by `OptimizeConflictReconciliationSuite`; here the columnar path is exercised
- * directly with a stub columnar child, since a columnar execution backend is not available in the
- * OSS test harness. Both paths fold units into runs through the same `RunTracker`.
+ * Tests for the source-composition capture a compaction OPTIMIZE performs.
+ *
+ * The columnar path of [[SourceCompositionCaptureExec]] is exercised directly with a stub columnar
+ * child, since a columnar execution backend is not available in the OSS test harness; both the row
+ * and columnar paths fold units into runs through the same `RunTracker`. The end-to-end tests then
+ * run a real compaction OPTIMIZE and assert what the write side persists on the removed-source
+ * tombstones: contiguous per-source composition tags when the capture is trustworthy, and a safe
+ * fall back to plain untagged tombstones (so a losing DML aborts as today) when it is not.
  */
-class SourceCompositionCaptureExecSuite extends QueryTest with SharedSparkSession {
+class SourceCompositionCaptureExecSuite extends QueryTest with DeltaSQLCommandTest {
 
   test("columnar path folds one run per source file across batches, in write order") {
     val acc = new SourceCompositionAccumulator
@@ -69,6 +84,122 @@ class SourceCompositionCaptureExecSuite extends QueryTest with SharedSparkSessio
     val acc = new SourceCompositionAccumulator
     assert(SourceCompositionCaptureExec(FakeColumnarScan(Nil), acc).supportsColumnar)
     assert(!SourceCompositionCaptureExec(FakeRowScan(), acc).supportsColumnar)
+  }
+
+  test("compaction OPTIMIZE tags each multi-row-group source as one contiguous run") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      val hadoopConf = spark.sparkContext.hadoopConfiguration
+      val prevBlockSize = hadoopConf.get("parquet.block.size")
+      // A tiny row-group size so each source file is written as MANY row groups -- the multi-piece
+      // read that would defeat capture if a source were split across partitions. The pinned read
+      // must still land each source whole, folding its row groups into one contiguous run.
+      hadoopConf.set("parquet.block.size", "1024")
+      try {
+        // Two differently sized sources so contiguity is observable regardless of write order.
+        spark.range(0, 3000).repartition(1).write.format("delta").mode("append").save(path)
+        spark.range(3000, 5000).repartition(1).write.format("delta").mode("append").save(path)
+      } finally {
+        if (prevBlockSize == null) hadoopConf.unset("parquet.block.size")
+        else hadoopConf.set("parquet.block.size", prevBlockSize)
+      }
+
+      // Precondition: each source really is multi-row-group (otherwise the test proves nothing).
+      val rowGroups = rowGroupCountsPerFile(dir)
+      assert(rowGroups.size == 2 && rowGroups.forall(_ > 1),
+        s"expected two multi-row-group sources, got $rowGroups")
+
+      // A hostile ambient split size (512 bytes) breaks each multi-row-group source into many
+      // per-row-group splits before the read. The capture path pins the read against exactly this
+      // -- it clones the session and sets maxPartitionBytes to the compaction target and
+      // minPartitionNum = 1, so each source is read whole in one partition rather than as scattered
+      // splits -- and the tags below still come out contiguous per source.
+      withSQLConf(
+          DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true",
+          SQLConf.FILES_MAX_PARTITION_BYTES.key -> "512") {
+        sql(s"OPTIMIZE delta.`$path`")
+      }
+
+      val actions = optimizeCommitActions(path)
+      val adds = actions.collect { case a: AddFile => a }
+      val removes = actions.collect { case r: RemoveFile => r }
+      assert(adds.size == 1, "the bin compacts into a single output file")
+      assert(removes.size == 2, "both sources are removed")
+
+      // Every source is tagged and points at the one output.
+      val output = adds.head.path
+      assert(removes.forall { r =>
+        r.getTag(RemoveFile.Tags.COMPACTED_INTO)
+          .map(JsonUtils.fromJson[Seq[String]]).contains(Seq(output))
+      }, "each source must record the output it compacted into")
+
+      // (offset, physicalCount) for each source, in output order. No source DVs here, so
+      // physical == live.
+      val runs = removes
+        .map(r => compactionInfo(r).get.head)
+        .map(e => (e.rowOffsetInTarget.get, e.sourceNumPhysicalRecords.get))
+        .sortBy(_._1)
+      // The runs tile the output contiguously from offset 0, with no gaps or overlaps.
+      assert(runs.head._1 == 0L, s"first run must start at offset 0: $runs")
+      assert(runs(1)._1 == runs(0)._1 + runs(0)._2, s"runs are not contiguous: $runs")
+      assert(runs.map(_._2).sum == 5000L, s"runs must cover every output row: $runs")
+      assert(runs.map(_._2).toSet == Set(2000L, 3000L), s"unexpected run sizes: $runs")
+    }
+  }
+
+  test("a source without row-count stats fails the gate -> untagged tombstones (aborts as today)") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      // Write the sources with stats collection OFF, so their AddFiles carry no numLogicalRecords
+      // -- one of the trustworthiness conditions the capture gate requires.
+      withSQLConf(DeltaSQLConf.DELTA_COLLECT_STATS.key -> "false") {
+        spark.range(0, 2000).repartition(1).write.format("delta").mode("append").save(path)
+        spark.range(2000, 4000).repartition(1).write.format("delta").mode("append").save(path)
+      }
+      // Sanity: the sources indeed lack the stat the gate checks.
+      val deltaLog = DeltaLog.forTable(spark, path)
+      assert(deltaLog.update().allFiles.collect().forall(_.numLogicalRecords.isEmpty),
+        "sources must have no row-count stats for this test to exercise the gate")
+
+      withSQLConf(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true") {
+        sql(s"OPTIMIZE delta.`$path`")
+      }
+
+      val actions = optimizeCommitActions(path)
+      val adds = actions.collect { case a: AddFile => a }
+      val removes = actions.collect { case r: RemoveFile => r }
+      assert(adds.size == 1 && removes.size == 2, "the sources are still compacted")
+      // Capture ran (reconcile was on) but the missing stats make it untrustworthy: the write side
+      // must fall back to plain untagged tombstones, so a losing DML aborts exactly as it does
+      // today -- never a bogus offset remap.
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTED_INTO).isEmpty))
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTION_INFO).isEmpty))
+      // The compaction itself is otherwise a normal OPTIMIZE: data is intact.
+      checkAnswer(spark.read.format("delta").load(path), (0 until 4000).map(i => Row(i.toLong)))
+    }
+  }
+
+  /** Actions committed by the single OPTIMIZE at the table's current (latest) version. */
+  private def optimizeCommitActions(path: String): Seq[Action] = {
+    val deltaLog = DeltaLog.forTable(spark, path)
+    val optimizeVersion = deltaLog.update().version
+    deltaLog.getChanges(startVersion = optimizeVersion, catalogTableOpt = None).next()._2
+  }
+
+  /** The compaction composition recorded on a source tombstone, if it was tagged. */
+  private def compactionInfo(r: RemoveFile): Option[Seq[CompactionInfoEntry]] =
+    r.getTag(RemoveFile.Tags.COMPACTION_INFO).map(JsonUtils.fromJson[Seq[CompactionInfoEntry]])
+
+  /** Number of Parquet row groups in each data file physically present under the table dir. */
+  private def rowGroupCountsPerFile(dir: File): Seq[Int] = {
+    // scalastyle:off deltahadoopconfiguration
+    val conf = spark.sessionState.newHadoopConf()
+    // scalastyle:on deltahadoopconfiguration
+    dir.listFiles().filter(_.getName.endsWith(".parquet")).toSeq.map { f =>
+      val input = HadoopInputFile.fromPath(new Path(f.getAbsolutePath), conf)
+      val reader = ParquetFileReader.open(input)
+      try reader.getRowGroups.size() finally reader.close()
+    }
   }
 }
 
