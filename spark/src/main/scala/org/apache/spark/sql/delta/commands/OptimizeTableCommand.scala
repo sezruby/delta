@@ -603,47 +603,30 @@ class OptimizeExecutor(
           s"Unexpected action $other with type ${other.getClass}. File compaction job output" +
               s"should only have AddFiles")
     }
-    // Record each removed source's placement in the compacted output (only when reconciliation is
-    // enabled and the capture is trustworthy) so the conflict checker can remap a concurrent DML
-    // deletion vector by offset instead of aborting; see buildCompactionCompositionTags. Empty when
-    // capture was off or the gate rejected it -- then the sources below are tombstoned untagged and
-    // the loser aborts as it does today.
-    val srcCompositionTag: Map[String, Map[String, String]] =
-      buildCompactionCompositionTags(txn, bin, addFiles, captureAccOpt)
-
-    // Fast path: no composition tag (capture off, or the gate above rejected it) -> build the
-    // RemoveFiles exactly as vanilla OPTIMIZE does, with no per-file tag lookup.
-    val removeFiles = if (srcCompositionTag.isEmpty) {
-      bin.map(_.removeWithTimestamp(operationTimestamp, dataChange = false))
-    } else {
-      bin.map { f =>
-        val r = f.removeWithTimestamp(operationTimestamp, dataChange = false)
-        srcCompositionTag.get(f.path) match {
-          case Some(tags) =>
-            // Persist the composition (as Databricks Runtime does on every compaction OPTIMIZE): it
-            // is consumed in-memory when THIS OPTIMIZE loses to a concurrent DML, and read from the
-            // committed tombstone when a concurrent DML LOSES to this OPTIMIZE.
-            tags.foldLeft(r) { case (tagged, (k, v)) => tagged.copyWithTag(k, v) }
-          case None => r
-        }
-      }
-    }
+    // Build the removed-source tombstones, tagging each with where its rows landed in the compacted
+    // output when reconciliation is enabled and the capture is trustworthy, so the conflict checker
+    // can remap a concurrent DML deletion vector by offset instead of aborting; otherwise plain
+    // untagged tombstones as vanilla OPTIMIZE writes (see the helper below).
+    val removeFiles = buildRemoveFilesWithCompactionCompositionTags(
+      txn, bin, addFiles, captureAccOpt, operationTimestamp)
     val updates = addFiles ++ removeFiles
     updates
   }
 
   /**
-   * Build the `compactedInto` / `compactionInfo` composition tags for a compaction OPTIMIZE's
-   * removed sources: a map from each source's table-relative AddFile path to the tag pair recording
-   * where that source's rows landed in the single compacted output. Written on the source's
-   * tombstone (see [[RemoveFile.Tags.COMPACTION_INFO]]) so a concurrent DML's deletion vector
-   * can be remapped by offset instead of aborting; the value format matches Databricks Runtime,
-   * so the two engines can reconcile against each other on a shared table.
+   * Build the removed-source tombstones for a compaction OPTIMIZE, tagging each with its
+   * `compactedInto` / `compactionInfo` composition -- where that source's rows landed in the single
+   * compacted output -- so a concurrent DML's deletion vector can be remapped by offset instead of
+   * aborting (see [[RemoveFile.Tags.COMPACTION_INFO]]). The composition is persisted, as Databricks
+   * Runtime does on every compaction OPTIMIZE: consumed in-memory when THIS OPTIMIZE loses to a
+   * concurrent DML, and read back from the committed tombstone when a concurrent DML LOSES to this
+   * OPTIMIZE. The tag format is modeled on the one Databricks Runtime writes; reconciling against a
+   * DBR-written tag on a shared table is best-effort, not a verified guarantee.
    *
-   * Returns empty -- so the caller tombstones every source untagged and the conflict falls back to
-   * today's abort -- unless the capture is present (reconciliation was enabled) AND trustworthy:
-   * exactly one output file from exactly one write partition, and each source contributed exactly
-   * one captured run covering the whole bin (a sanity gate against retries / speculation / splits).
+   * Falls back to plain untagged tombstones -- so the conflict aborts as it does today -- unless
+   * the capture is present (reconciliation was enabled) AND trustworthy: exactly one output file
+   * from exactly one write partition, and each source contributed exactly one captured run covering
+   * the whole bin (a sanity gate against retries / speculation / splits).
    *
    * Each source's `compactionInfo` records `sourceNumPhysicalRecords` (the live rows the write saw
    * PLUS the source's read-time DV cardinality), not the live count, so the tags stay O(1) per
@@ -651,11 +634,17 @@ class OptimizeExecutor(
    * length by subtracting the tombstone's own DV, and rebuilds the read-time gaps only on a real
    * conflict.
    */
-  private def buildCompactionCompositionTags(
+  private def buildRemoveFilesWithCompactionCompositionTags(
       txn: OptimisticTransaction,
       bin: Seq[AddFile],
       addFiles: Seq[AddFile],
-      captureAccOpt: Option[SourceCompositionAccumulator]): Map[String, Map[String, String]] = {
+      captureAccOpt: Option[SourceCompositionAccumulator],
+      operationTimestamp: Long): Seq[RemoveFile] = {
+    // The fallback: plain untagged tombstones, exactly as vanilla OPTIMIZE writes them, whenever
+    // the capture is off or the trustworthiness gate below rejects it (the loser aborts as today).
+    def untagged: Seq[RemoveFile] =
+      bin.map(_.removeWithTimestamp(operationTimestamp, dataChange = false))
+
     captureAccOpt match {
       case Some(acc) if addFiles.size == 1 && acc.value.size() == 1 &&
           bin.forall(_.numLogicalRecords.isDefined) =>
@@ -667,11 +656,10 @@ class OptimizeExecutor(
         // conflict-resolution time.
         val nameToAddFile = generateCandidateFileMap(txn.deltaLog.dataPath, bin)
         val tablePath = txn.deltaLog.dataPath
-        val outputPath = addFiles.head.path
-        val compactedIntoJson = JsonUtils.toJson(Seq(outputPath))
+        val compactedIntoJson = JsonUtils.toJson(Seq(addFiles.head.path))
         // Walk runs in output (write) order, accumulating each source's start offset in the output.
         var outputPos = 0L
-        val perFile: Seq[Option[(String, Map[String, String])]] = (0 until runs.size()).map { i =>
+        val tagByPath: Seq[Option[(String, Map[String, String])]] = (0 until runs.size()).map { i =>
           val r = runs.get(i)
           val start = outputPos
           outputPos += r.count
@@ -699,13 +687,18 @@ class OptimizeExecutor(
         // Each source file mapped and produced exactly one captured run covering the whole bin.
         val oneRunPerFile = runs.size() == bin.size &&
           (0 until runs.size()).map(runs.get(_).sourceFile).distinct.size == bin.size
-        if (captured == expected && perFile.forall(_.isDefined) && oneRunPerFile) {
-          perFile.map(_.get).toMap
+        if (captured == expected && tagByPath.forall(_.isDefined) && oneRunPerFile) {
+          val tags = tagByPath.flatten.toMap
+          bin.map { f =>
+            val r = f.removeWithTimestamp(operationTimestamp, dataChange = false)
+            tags.get(f.path).fold(r)(
+              _.foldLeft(r) { case (tagged, (k, v)) => tagged.copyWithTag(k, v) })
+          }
         } else {
-          Map.empty[String, Map[String, String]]
+          untagged
         }
       case _ =>
-        Map.empty[String, Map[String, String]]
+        untagged
     }
   }
 
