@@ -1193,6 +1193,56 @@ case class RemoveFile(
 }
 // scalastyle:on
 
+object RemoveFile {
+  /**
+   * Misc tombstone-level metadata. Clients may safely ignore any of these tags; they must never
+   * affect correctness (an ignored tag only forgoes an optimization, e.g. a conflict reconcile).
+   */
+  object Tags {
+    /**
+     * [[COMPACTED_INTO]] / [[COMPACTION_INFO]]: recorded together on a source file removed by a
+     * compaction OPTIMIZE, describing where that source's rows landed in the compacted output, so
+     * the conflict checker can remap a concurrent deletion vector between the source and the output
+     * instead of aborting. The value format is modeled on what Databricks Runtime records;
+     * interoperating with a DBR-written OPTIMIZE on a shared table is best-effort and not a
+     * verified guarantee (an ignored or unrecognized tag only forgoes the reconcile -- never wrong
+     * data).
+     *
+     *  - [[COMPACTED_INTO]]: JSON array holding the single output path the source compacted into,
+     *    `["<output>.parquet"]` (matching the AddFile.path in the same commit).
+     *  - [[COMPACTION_INFO]]: JSON array holding the single run this source contributed,
+     *    `[{"rowOffsetInTarget": <outputStart>, "sourceNumPhysicalRecords": <physical>}]`. The
+     *    source's live rows land contiguously starting at physical offset `outputStart` of the
+     *    output, in source order. `sourceNumPhysicalRecords` is a PHYSICAL count; the live run
+     *    length is `sourceNumPhysicalRecords - |sourceDV|`, where `sourceDV` is the DV already on
+     *    this same tombstone (the DV the OPTIMIZE read). The physical count keeps the entry
+     *    self-consistent with the tombstone's own DV.
+     *
+     * Kept on the (short-lived) tombstone rather than the output AddFile (which snapshot
+     * reconstruction replays on every read); tombstone retention outlives the conflict window.
+     * Persisted (not stripped before commit) so a concurrent DML that LOSES to this OPTIMIZE can
+     * read the composition from the committed tombstone. Written whenever OPTIMIZE conflict
+     * reconciliation is enabled. O(1) per removed source.
+     */
+    val COMPACTED_INTO = "compactedInto"
+    val COMPACTION_INFO = "compactionInfo"
+  }
+}
+
+/**
+ * The per-source entry recorded in a compaction OPTIMIZE's `compactionInfo` tombstone tag: where
+ * that source's rows landed in the compacted output. The format is modeled on Databricks Runtime's
+ * (see [[RemoveFile.Tags.COMPACTION_INFO]]); reconciling against a DBR-written tag on a shared
+ * table is best-effort, not a verified guarantee. Every field is optional and unknown fields are
+ * ignored, so a foreign writer's schema drift degrades to a safe abort rather than a wrong result.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+private[delta] case class CompactionInfoEntry(
+    @JsonDeserialize(contentAs = classOf[java.lang.Long])
+    rowOffsetInTarget: Option[Long] = None,
+    @JsonDeserialize(contentAs = classOf[java.lang.Long])
+    sourceNumPhysicalRecords: Option[Long] = None)
+
 /**
  * A change file containing CDC data for the Delta version it's within. Non-CDC readers should
  * ignore this, CDC readers should scan all ChangeFiles in a version rather than computing
