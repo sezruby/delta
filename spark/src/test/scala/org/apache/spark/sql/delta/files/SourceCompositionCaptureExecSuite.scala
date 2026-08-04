@@ -50,6 +50,21 @@ class SourceCompositionCaptureExecSuite extends QueryTest with SharedSparkSessio
     assert(runs == Seq(SourceRun("fileA", 5), SourceRun("fileB", 4)))
   }
 
+  test("interleaved source batches surface as separate runs (the mixed shape the gate rejects)") {
+    val acc = new SourceCompositionAccumulator
+    spark.sparkContext.register(acc)
+    // fileA, fileB, then fileA again -- the interleaving a split-and-packed scan can produce when a
+    // single source file is broken into row-group splits that pack non-adjacently.
+    val child = FakeColumnarScan(Seq(("fileA", 3), ("fileB", 4), ("fileA", 2)))
+    SourceCompositionCaptureExec(child, acc).executeColumnar().foreach(_ => ())
+
+    assert(acc.value.size() == 1)
+    val runs = acc.value.get(0).asScala.toSeq
+    // fileA is NOT folded across fileB: it appears as two runs. A downstream one-run-per-file gate
+    // therefore sees fileA twice and declines to record a (mixed) composition -- reconcile aborts.
+    assert(runs == Seq(SourceRun("fileA", 3), SourceRun("fileB", 4), SourceRun("fileA", 2)))
+  }
+
   test("supportsColumnar mirrors the child so the operator stays columnar-transparent") {
     val acc = new SourceCompositionAccumulator
     assert(SourceCompositionCaptureExec(FakeColumnarScan(Nil), acc).supportsColumnar)
