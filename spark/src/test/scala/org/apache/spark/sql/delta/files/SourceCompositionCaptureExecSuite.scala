@@ -179,6 +179,34 @@ class SourceCompositionCaptureExecSuite extends QueryTest with DeltaSQLCommandTe
     }
   }
 
+  test("repartition OPTIMIZE writes no composition tags (capture is coalesce-only)") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(0, 2000).repartition(1).write.format("delta").mode("append").save(path)
+      spark.range(2000, 4000).repartition(1).write.format("delta").mode("append").save(path)
+
+      // Reconcile is on, but the repartition compaction path shuffles rows into the output, so no
+      // source keeps a contiguous row range -- an offset composition would be meaningless (and a
+      // DV remapped by it would corrupt data). The capture gate excludes this path, so the sources
+      // must be removed with plain untagged tombstones, exactly as vanilla OPTIMIZE writes.
+      withSQLConf(
+          DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED.key -> "true",
+          DeltaSQLConf.DELTA_OPTIMIZE_REPARTITION_ENABLED.key -> "true") {
+        sql(s"OPTIMIZE delta.`$path`")
+      }
+
+      val actions = optimizeCommitActions(path)
+      val adds = actions.collect { case a: AddFile => a }
+      val removes = actions.collect { case r: RemoveFile => r }
+      assert(adds.size == 1 && removes.size == 2, "the sources are still compacted")
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTED_INTO).isEmpty),
+        "the repartition path must not record where sources landed -- rows were shuffled")
+      assert(removes.forall(_.getTag(RemoveFile.Tags.COMPACTION_INFO).isEmpty),
+        "the repartition path must not record where sources landed -- rows were shuffled")
+      checkAnswer(spark.read.format("delta").load(path), (0 until 4000).map(i => Row(i.toLong)))
+    }
+  }
+
   /** Actions committed by the single OPTIMIZE at the table's current (latest) version. */
   private def optimizeCommitActions(path: String): Seq[Action] = {
     val deltaLog = DeltaLog.forTable(spark, path)
