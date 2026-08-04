@@ -39,7 +39,9 @@ import org.apache.parquet.hadoop.{Footer, ParquetFileReader}
 import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.MDC
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.{SerializableConfiguration, ThreadUtils}
 
 /**
@@ -230,6 +232,17 @@ object DeltaFileOperations extends DeltaLogging {
    *                          that are children to the path will be listed. If false, the paths are
    *                          treated as filenames, and files under the same folder with filenames
    *                          after the path will be listed instead.
+   * @param initialListingDepth The number of directory levels to list shallowly (one level per
+   *                            distributed round, re-distributing the frontier after each round)
+   *                            before handing the remaining directories to the parallel subtree
+   *                            recursion. Must be >= 1. The default of 1 preserves the original
+   *                            behavior: only the immediate children of `subDirs` are listed before
+   *                            fanning out, which can leave a single task listing an entire large
+   *                            subtree when the first level is skewed (e.g. a low-cardinality
+   *                            partition column, or `_change_data`). A larger value descends that
+   *                            many levels first so more directories are available to distribute.
+   *                            The listed set is identical regardless of this value; only the
+   *                            listing parallelism changes.
    */
   def recursiveListDirs(
       spark: SparkSession,
@@ -238,14 +251,19 @@ object DeltaFileOperations extends DeltaLogging {
       hiddenDirNameFilter: String => Boolean = defaultHiddenFileFilter,
       hiddenFileNameFilter: String => Boolean = defaultHiddenFileFilter,
       fileListingParallelism: Option[Int] = None,
-      listAsDirectories: Boolean = true): Dataset[SerializableFileStatus] = {
+      listAsDirectories: Boolean = true,
+      initialListingDepth: Int = 1): Dataset[SerializableFileStatus] = {
     import org.apache.spark.sql.delta.implicits._
     if (subDirs.isEmpty) return spark.emptyDataset[SerializableFileStatus]
-    val listParallelism = fileListingParallelism.getOrElse(spark.sparkContext.defaultParallelism)
-    val subDirsParallelism = subDirs.length.min(spark.sparkContext.defaultParallelism)
-    val dirsAndFiles = spark.sparkContext.parallelize(
-        subDirs,
-        subDirsParallelism).mapPartitions { dirs =>
+    require(initialListingDepth >= 1,
+      s"initialListingDepth must be >= 1, but got $initialListingDepth")
+    val sc = spark.sparkContext
+    val listParallelism = fileListingParallelism.getOrElse(sc.defaultParallelism)
+    val subDirsParallelism = subDirs.length.min(sc.defaultParallelism)
+
+    // Level 0: shallow-list the supplied roots. `listAsDirectories` only applies to this level;
+    // every level below consists of real directories.
+    val firstLevel = sc.parallelize(subDirs, subDirsParallelism).mapPartitions { dirs =>
       val logStore = LogStore(SparkEnv.get.conf, hadoopConf.value.value)
       listUsingLogStore(
         logStore,
@@ -255,16 +273,43 @@ object DeltaFileOperations extends DeltaLogging {
         hiddenDirNameFilter, hiddenFileNameFilter, listAsDirectories)
     }.repartition(listParallelism) // Initial list of subDirs may be small
 
-    val allDirsAndFiles = dirsAndFiles.mapPartitions { firstLevelDirsAndFiles =>
+    // Optionally descend `initialListingDepth - 1` further levels breadth-first, re-distributing
+    // the frontier after each level, so the parallel recursion below starts from a well-spread set
+    // of directories rather than a possibly skewed first level. Files, and interior directories
+    // whose children are listed here, are emitted as they are found; only the final frontier of
+    // directories is passed to the subtree recursion (which emits those directories itself).
+    var frontier = firstLevel
+    var collected: RDD[SerializableFileStatus] = sc.emptyRDD[SerializableFileStatus]
+    var levelsToDescend = initialListingDepth - 1
+    while (levelsToDescend > 0) {
+      // Consumed twice below (emitted + re-listed), so avoid re-hitting the file system.
+      frontier.persist(StorageLevel.MEMORY_AND_DISK)
+      val interiorDirs = frontier.filter(_.isDir)
+      collected = collected
+        .union(frontier.filter(f => !f.isDir)) // terminal files at this level
+        .union(interiorDirs) // interior directories, emitted exactly once
+      frontier = interiorDirs.map(_.path).mapPartitions { dirs =>
+        val logStore = LogStore(SparkEnv.get.conf, hadoopConf.value.value)
+        listUsingLogStore(
+          logStore,
+          hadoopConf.value.value,
+          dirs,
+          recurse = false,
+          hiddenDirNameFilter, hiddenFileNameFilter)
+      }.repartition(listParallelism)
+      levelsToDescend -= 1
+    }
+
+    val allDirsAndFiles = frontier.mapPartitions { frontierDirsAndFiles =>
       val logStore = LogStore(SparkEnv.get.conf, hadoopConf.value.value)
       recurseDirectories(
         logStore,
         hadoopConf.value.value,
-        firstLevelDirsAndFiles,
+        frontierDirsAndFiles,
         hiddenDirNameFilter,
         hiddenFileNameFilter)
     }
-    spark.createDataset(allDirsAndFiles)
+    spark.createDataset(collected.union(allDirsAndFiles))
   }
 
   /**

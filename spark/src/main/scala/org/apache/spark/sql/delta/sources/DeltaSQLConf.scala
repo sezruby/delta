@@ -782,6 +782,20 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .checkValue(_ > 0, "parallelDelete.parallelism must be positive")
       .createOptional
 
+  val DELTA_VACUUM_LISTING_INITIAL_DEPTH =
+    buildConf("vacuum.listing.initialDepth")
+      .doc("The number of directory levels VACUUM lists shallowly (re-distributing the frontier " +
+        "across the cluster after each level) before fanning out to the parallel recursive " +
+        "listing. The default of 1 lists only the table's immediate children before fanning out, " +
+        "which can leave a single task listing an entire large subtree when the first level is " +
+        "skewed (e.g. a low-cardinality partition column, or the _change_data directory). " +
+        "Increasing this descends that many levels first so more directories are available to " +
+        "distribute, improving listing parallelism for such layouts. The set of files considered " +
+        "by VACUUM is unchanged; only the listing parallelism differs.")
+      .intConf
+      .checkValue(_ >= 1, "vacuum.listing.initialDepth must be at least 1")
+      .createWithDefault(1)
+
   val ENFORCE_DELETED_FILE_AND_LOG_RETENTION_DURATION_COMPATIBILITY =
     buildConf("vacuum.enforceDeletedFileAndLogRetentionDurationCompatibility")
       .internal()

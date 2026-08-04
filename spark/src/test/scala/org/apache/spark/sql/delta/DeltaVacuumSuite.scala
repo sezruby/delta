@@ -53,7 +53,7 @@ import org.apache.spark.sql.functions.{col, expr, lit}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
-import org.apache.spark.util.ManualClock
+import org.apache.spark.util.{ManualClock, SerializableConfiguration}
 
 trait DeltaVacuumSuiteBase extends QueryTest
   with SharedSparkSession
@@ -507,6 +507,97 @@ class DeltaVacuumSuite extends DeltaVacuumSuiteBase with DeltaSQLCommandTest {
 
   override def sparkConf: SparkConf = {
     super.sparkConf.set("spark.sql.sources.parallelPartitionDiscovery.parallelism", "2")
+  }
+
+  private def broadcastHadoopConf(): org.apache.spark.broadcast.Broadcast[
+      SerializableConfiguration] = {
+    // scalastyle:off deltahadoopconfiguration
+    val conf = spark.sessionState.newHadoopConf()
+    // scalastyle:on deltahadoopconfiguration
+    spark.sparkContext.broadcast(new SerializableConfiguration(conf))
+  }
+
+  test("recursiveListDirs returns the same files and directories for any initialListingDepth") {
+    withTempDir { tempDir =>
+      // A tree with files at multiple depths and empty directories, including a nested only-child
+      // empty chain (d/e) and an empty directory beside files (a/emptyB). The set of listed
+      // files/directories must not depend on how many levels are listed before fanning out.
+      val base = tempDir.getAbsolutePath
+      def mkFile(rel: String): Unit = {
+        val f = new File(base, rel)
+        f.getParentFile.mkdirs()
+        FileUtils.write(f, "x")
+      }
+      def mkDir(rel: String): Unit = assert(new File(base, rel).mkdirs())
+
+      mkFile("f0.txt")
+      mkFile("a/f1.txt")
+      mkFile("a/b/f2.txt")
+      mkFile("a/b/c/f3.txt")
+      mkDir("a/emptyB")
+      mkDir("d/e")
+      mkDir("g")
+
+      val hadoopConf = broadcastHadoopConf()
+      def listAt(depth: Int): Set[(String, Boolean)] = DeltaFileOperations.recursiveListDirs(
+          spark,
+          Seq(new Path(base).toString),
+          hadoopConf,
+          hiddenDirNameFilter = _ => false,
+          hiddenFileNameFilter = _ => false,
+          initialListingDepth = depth)
+        .collect()
+        .map(f => (f.path, f.isDir))
+        .toSet
+
+      val expected = listAt(1)
+      // Sanity-check that the whole tree (4 files, 7 directories) was actually discovered.
+      assert(expected.count(!_._2) === 4, s"expected 4 files, got $expected")
+      assert(expected.count(_._2) === 7, s"expected 7 directories, got $expected")
+
+      // Identical result for every depth, including depths deeper than the tree itself.
+      (2 to 5).foreach { depth =>
+        assert(listAt(depth) === expected,
+          s"listing at initialListingDepth=$depth differed from initialListingDepth=1")
+      }
+    }
+  }
+
+  test("recursiveListDirs rejects a non-positive initialListingDepth") {
+    withTempDir { tempDir =>
+      val e = intercept[IllegalArgumentException] {
+        DeltaFileOperations.recursiveListDirs(
+          spark,
+          Seq(new Path(tempDir.getAbsolutePath).toString),
+          broadcastHadoopConf(),
+          initialListingDepth = 0)
+      }
+      assert(e.getMessage.contains("initialListingDepth must be >= 1"))
+    }
+  }
+
+  testFullVacuumOnly(
+    "VACUUM with a larger vacuum.listing.initialDepth deletes the same untracked files") {
+    withSQLConf(DeltaSQLConf.DELTA_VACUUM_LISTING_INITIAL_DEPTH.key -> "3") {
+      withEnvironment { (tempDir, _) =>
+        val table = DeltaTableV2(spark, tempDir)
+        val committed = "committed.txt"
+        val untrackedShallow = "sub/untrackedShallow.txt"
+        // Nested deeper than initialDepth=3 so the recursive fan-out past the shallow-listed
+        // levels must still reach it.
+        val untrackedDeep = "sub/w/x/y/untrackedDeep.txt"
+        gcTest(table, new ManualClock())(
+          CreateFile(committed, commitToActionLog = true),
+          CreateFile(untrackedShallow, commitToActionLog = false),
+          CreateFile(untrackedDeep, commitToActionLog = false),
+          CheckFiles(Seq(committed, untrackedShallow, untrackedDeep)),
+          // The SQL VACUUM path uses the wall clock, so the epoch-0 files are past retention. A
+          // depth of 3 must still discover the deeply nested untracked file.
+          ExecuteVacuumInSQL(s"'$tempDir'", Seq(tempDir.toString)),
+          CheckFiles(Seq(committed)),
+          CheckFiles(Seq(untrackedShallow, untrackedDeep), exist = false))
+      }
+    }
   }
 
   testQuietly("basic case - SQL command on path-based tables with direct 'path'") {

@@ -912,6 +912,9 @@ trait VacuumCommandImpl extends DeltaCommand {
       ((_: String) => false, (_: String) => false)
     }
 
+    val initialListingDepth =
+      spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_VACUUM_LISTING_INITIAL_DEPTH)
+
     // Use DeltaFileOperations.recursiveListDirs
     val files = DeltaFileOperations.recursiveListDirs(
       spark,
@@ -919,7 +922,8 @@ trait VacuumCommandImpl extends DeltaCommand {
       hadoopConf,
       hiddenDirNameFilter = hiddenDirFilter,
       hiddenFileNameFilter = hiddenFileFilter,
-      fileListingParallelism = parallelism
+      fileListingParallelism = parallelism,
+      initialListingDepth = initialListingDepth
     )
       .map { f =>
         // Make paths url-encoded (same pattern as VacuumCommand)
