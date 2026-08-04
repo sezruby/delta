@@ -1219,10 +1219,12 @@ object RemoveFile {
      *    self-consistent with the tombstone's own DV.
      *
      * Kept on the (short-lived) tombstone rather than the output AddFile (which snapshot
-     * reconstruction replays on every read); tombstone retention outlives the conflict window.
-     * Persisted (not stripped before commit) so a concurrent DML that LOSES to this OPTIMIZE can
-     * read the composition from the committed tombstone. Written whenever OPTIMIZE conflict
-     * reconciliation is enabled. O(1) per removed source.
+     * reconstruction replays on every read); tombstone retention (default ~7 days) comfortably
+     * outlives the conflict window (a concurrent transaction's runtime), so the tag is still
+     * present when a losing DML reads it. Persisted
+     * (not stripped before commit) so a concurrent DML that LOSES to this OPTIMIZE can read the
+     * composition from the committed tombstone. Written whenever OPTIMIZE conflict reconciliation
+     * is enabled in either direction. O(1) per removed source.
      */
     val COMPACTED_INTO = "compactedInto"
     val COMPACTION_INFO = "compactionInfo"

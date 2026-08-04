@@ -45,6 +45,16 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
         currentTransactionInfo.protocol, currentTransactionInfo.metadata)
 
   /**
+   * Whether the reverse direction (DML loses to a compaction OPTIMIZE) is enabled. `protected` so
+   * [[RowLevelConcurrencyResolution.canSkipAddedFileForRowLevelConcurrency]] (mixed into the same
+   * checker) can also let the reverse remap's re-added outputs skip the append check.
+   */
+  protected lazy val optimizeReverseReconciliationEnabled: Boolean =
+    spark.conf.get(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED) &&
+      DeletionVectorUtils.deletionVectorsWritable(
+        currentTransactionInfo.protocol, currentTransactionInfo.metadata)
+
+  /**
    * Compaction OPTIMIZE vs a concurrent row-level DML. An OPTIMIZE that removed a source file `F`
    * and compacted it into an output `O` conflicts with a concurrent DELETE/UPDATE that added a
    * deletion vector to `F`. Instead of aborting, remap the concurrent DV onto `O`: the compaction
@@ -196,6 +206,197 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
             "winningCommitVersion" -> winningCommitVersion,
             "resolvedSources" -> resolvedSources.size,
             "outputsRemapped" -> addReplacements.size,
+            "winningOperation" -> winningOperationName.getOrElse("UNKNOWN")))
+      }
+    }
+  }
+
+  /**
+   * Reverse direction of [[resolveOptimizeConflicts]]: the current transaction is a row-level DML
+   * (DELETE/UPDATE) and the WINNING commit is a compaction OPTIMIZE that removed the source files
+   * this DML added deletion vectors to. Instead of aborting, remap the DML's deletions onto the
+   * winner's compacted output(s).
+   *
+   * The winner persisted, on each removed source's tombstone, that source's placement in the output
+   * -- `(outputPath, outputStart, liveCount)`, read via
+   * [[ConflictChecker.parseOptimizeSourceComposition]] from the `compactedInto` / `compactionInfo`
+   * tags (a format modeled on what Databricks Runtime records; cross-engine reconciliation
+   * against a DBR-written OPTIMIZE is best-effort, not a verified guarantee): removed
+   * source `F`'s live rows landed contiguously at `[outputStart, outputStart + liveCount)`
+   * of output `C`, in physical order. `F`'s deletion vector when the OPTIMIZE read it (`Do`, the
+   * rows it excluded from `C`) is carried on that same winner `RemoveFile(F)`. A row `i` the DML
+   * deletes lands at
+   * `outputStart + liveRank_Do(i)`, where `liveRank_Do(i) = i - |Do below i|`; that position is
+   * unioned into `C`'s (initially empty) deletion vector.
+   *
+   * Conservative and safe-by-abort: only when the winning commit is a PURE compaction (every
+   * removed file is in some output's composition and every added file is a composition output),
+   * only remapping the DML's NEW deletions (`loserDv \ loserReadDv`), only if every such row is
+   * live in `C` (not in `Do`) and maps within the source's run; otherwise leave everything to the
+   * standard checks (abort). A pure compaction is a `dataChange=false` relocation, so the DML's
+   * read is invariant to it; every compaction source/output is marked resolved for the file checks.
+   */
+  protected def resolveReverseOptimizeConflicts(): Unit = {
+    if (!optimizeReverseReconciliationEnabled) return
+
+    // Every source the winner removed must carry a composition pointing at one of this commit's
+    // outputs, and every added file must be a referenced compaction output -- i.e. the winning
+    // commit is a PURE compaction. Otherwise we cannot safely rebase the DML onto it, so fall
+    // through to abort. The composition is read via `parseOptimizeSourceComposition` from the
+    // `compactedInto` / `compactionInfo` tags (a format modeled on Databricks Runtime's;
+    // cross-engine reconciliation is best-effort); an unrecognized shape -> None (abort).
+    val winnerRemoves = winningCommitSummary.removedFiles
+    val winnerOutputs = winningCommitSummary.addedFiles
+    if (winnerRemoves.isEmpty || winnerOutputs.isEmpty) return
+    val winnerRemoveByPath = winnerRemoves.map(r => r.path -> r).toMap
+    val outByPath = winnerOutputs.map(a => a.path -> a).toMap
+    val outputPaths = outByPath.keySet
+
+    // source path -> (output, liveCount, outputStart): the source's `liveCount` live rows land
+    // contiguously at output positions [outputStart, outputStart + liveCount) in physical order,
+    // read from the source tombstone's tag (the output AddFile is resolved by the recorded path).
+    val srcToRun = mutable.Map.empty[String, (AddFile, Long, Long)]
+    val referencedOutputs = mutable.Set.empty[String]
+    var pureCompaction = true
+    for (r <- winnerRemoves if pureCompaction) {
+      ConflictChecker.parseOptimizeSourceComposition(r, outputPaths) match {
+        case Some((outputPath, outputStart, liveCount)) =>
+          srcToRun(r.path) = (outByPath(outputPath), liveCount, outputStart)
+          referencedOutputs += outputPath
+        case None =>
+          // Absent/malformed tag, or a composition pointing outside this commit's outputs -> not a
+          // pure, self-contained compaction we can rebase onto.
+          pureCompaction = false
+      }
+    }
+    // Pure compaction: every added output must be a referenced compaction target (no stray
+    // appends), and a real compaction relocates rows (dataChange=false) -- a winner output claiming
+    // dataChange is not the pure relocation the DML's read is invariant to. The dataChange guard is
+    // belt-and-suspenders with the referenced-output check (a stray append would not be
+    // referenced).
+    if (!pureCompaction || referencedOutputs != outByPath.keySet ||
+        winnerOutputs.exists(_.dataChange)) {
+      return
+    }
+
+    // Current DML's DV updates: AddFile(F, dv) whose F the winner removed, plus their pre-image
+    // RemoveFile(F) (whose DV is the DML's read-time DV on F).
+    val currentAddByPath = currentTransactionInfo.actions.collect {
+      case a: AddFile if a.deletionVector != null && winnerRemoveByPath.contains(a.path) =>
+        a.path -> a
+    }.toMap
+    val currentRemoveByPath = currentTransactionInfo.actions.collect {
+      case r: RemoveFile => r.path -> r
+    }.toMap
+
+    val sharedPaths = currentAddByPath.keySet.intersect(currentRemoveByPath.keySet)
+    if (sharedPaths.isEmpty) return
+
+    recordTime("resolved-reverse-optimize-conflicts") {
+      val dvStore = DeletionVectorStore.createInstance(deltaLog.newDeltaHadoopConf())
+      val tablePath = deltaLog.dataPath
+
+      // Remapped DV accumulated per compacted output, seeded from the output's existing DV (a fresh
+      // compaction output normally has none, but seed defensively so a pre-existing DV is preserved
+      // rather than dropped when the output is tombstoned and re-added with the remapped DV).
+      val outputDv = mutable.Map.empty[String, RoaringBitmapArray]
+      val remappedSources = mutable.Set.empty[String]
+      var allResolvable = true
+
+      for (src <- sharedPaths if allResolvable) {
+        // `Do`: F's DV when the winner OPTIMIZE read it. Rows in `Do` were excluded from `C`.
+        val optimizeReadDv =
+          readDeletionVectorOrEmpty(dvStore, winnerRemoveByPath(src).deletionVector, tablePath)
+        // The DML's read-time DV on F and its final (post-delete) DV. Remap only the difference.
+        val loserReadDv =
+          readDeletionVectorOrEmpty(dvStore, currentRemoveByPath(src).deletionVector, tablePath)
+        val loserDv =
+          readDeletionVectorOrEmpty(dvStore, currentAddByPath(src).deletionVector, tablePath)
+        val optimizeDeleted = optimizeReadDv.toArray
+        val (out, liveCount, outputStart) = srcToRun(src)
+        // Defense-in-depth (parity with the forward remap) against a corrupt or foreign composition
+        // tag: the source's live run must fit within the output's physical record count. Out of
+        // range is impossible for a real capture -> abort rather than remap out of bounds.
+        if (out.numPhysicalRecords.exists(outputStart + liveCount > _)) {
+          allResolvable = false
+        }
+        loserDv.forEach { i =>
+          // The DML's DV is cumulative; remap only rows it newly deleted (vs its own read).
+          if (!loserReadDv.contains(i)) {
+            if (optimizeReadDv.contains(i)) {
+              // The OPTIMIZE already excluded this row from `C` (it saw a delete the DML did not):
+              // the compaction is not a consistent relocation of this row -> cannot remap.
+              allResolvable = false
+            } else {
+              // Live-rank of physical row `i` = i minus the OPTIMIZE-read deletions below it; its
+              // offset within the source's contiguous live-row run in the compacted output.
+              val ins = java.util.Arrays.binarySearch(optimizeDeleted, i)
+              val liveRank = i - (if (ins < 0) -(ins + 1) else ins)
+              if (liveRank >= 0 && liveRank < liveCount) {
+                val acc = outputDv.getOrElseUpdate(out.path,
+                  readDeletionVectorOrEmpty(dvStore, out.deletionVector, tablePath).copy())
+                acc.add(outputStart + liveRank)
+              } else {
+                allResolvable = false
+              }
+            }
+          }
+        }
+        if (allResolvable) remappedSources += src
+      }
+
+      // H1: The pure-compaction resolution below blanket-marks EVERY winner-removed source resolved
+      // for the file checks. But the remap loop only covers sources the DML re-added with a DV
+      // (`sharedPaths` = removed AND re-added). A source the DML *fully* deleted -- a bare
+      // `RemoveFile` with no re-added `AddFile` -- is winner-removed and DML-touched yet never
+      // remapped; blanket-resolving it would silently drop that delete. Abort unless every
+      // DML-touched winner-removed source was actually remapped.
+      val dmlTouchedWinnerSources = winnerRemoveByPath.keySet
+        .intersect(currentRemoveByPath.keySet.union(currentAddByPath.keySet))
+      if (allResolvable && !dmlTouchedWinnerSources.subsetOf(remappedSources)) {
+        allResolvable = false
+      }
+
+      // Reconcile only if every conflicting source was remappable; a partial remap could leave an
+      // un-reconciled conflict, so otherwise leave everything to the standard checks (abort).
+      if (allResolvable && outputDv.nonEmpty) {
+        // Each affected output: tombstone the winner's (path, no-DV) file and re-add it with the
+        // remapped DV (files are identified by path AND deletion vector). The composition lives on
+        // the winner's source tombstones (never on this output), and the re-added output's own
+        // tombstone would carry no composition tag, so a further concurrent loser aborts rather
+        // than remapping onto an already-DV'd output. Nothing to strip here.
+        val cRemoves = outputDv.keys.map(p => outByPath(p).removeWithTimestamp()).toSeq
+        val cAdds = outputDv.map { case (p, bmp) =>
+          val desc = writeMergedDeletionVector(dvStore, tablePath, bmp)
+          outByPath(p).copy(deletionVector = desc, dataChange = true)
+            .withoutTightBoundStats
+        }.toSeq
+
+        // Drop the DML's now-remapped AddFile/RemoveFile for the resolved sources; their deletions
+        // now live on the compacted output instead.
+        val newActions = currentTransactionInfo.actions.filterNot {
+          case a: AddFile => remappedSources.contains(a.path)
+          case r: RemoveFile => remappedSources.contains(r.path)
+          case _ => false
+        } ++ cRemoves ++ cAdds
+
+        // A pure compaction is a dataChange=false relocation: mark ALL of its removed sources and
+        // outputs resolved so neither the delete-read check (removed sources the DML read) nor the
+        // append check (outputs, via canSkipAddedFileForRowLevelConcurrency) re-triggers.
+        winnerRemoveByPath.keys.foreach(rowLevelResolvedPaths += _)
+        winnerOutputs.foreach(rowLevelResolvedPaths += _.path)
+        val newReadFiles = currentTransactionInfo.readFiles
+          .filterNot(f => winnerRemoveByPath.contains(f.path))
+        currentTransactionInfo =
+          currentTransactionInfo.copy(actions = newActions, readFiles = newReadFiles)
+
+        recordDeltaEvent(
+          deltaLog,
+          opType = "delta.optimize.conflictReconciliation.reverseRemapped",
+          data = Map(
+            "winningCommitVersion" -> winningCommitVersion,
+            "remappedSources" -> remappedSources.size,
+            "outputsRemapped" -> cAdds.size,
             "winningOperation" -> winningOperationName.getOrElse("UNKNOWN")))
       }
     }

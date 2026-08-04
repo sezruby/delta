@@ -339,12 +339,12 @@ class OptimizeConflictReconciliationSuite extends QueryTest
     }
   }
 
-  test("reverse direction: a losing DELETE against a compacted file still aborts") {
+  test("reverse direction OFF: a losing DELETE against a compacted file aborts") {
     withTempDir { dir =>
       val log = createMultiFileTable(dir)
-      // Only the OPTIMIZE-loser direction is reconciled here. When OPTIMIZE wins (commits first) and
-      // the DELETE loses, the delete's target file was compacted away; DELETE-loser reconciliation
-      // is a separate follow-up, so the loser aborts.
+      // Reverse reconciliation is a separate opt-in (reverse.enabled). With only the forward flag on,
+      // an OPTIMIZE that wins (commits first) against a losing DELETE compacts the delete's target
+      // file away, so the loser aborts.
       val txnDelete = sqlTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150", reconcile = true)
       val txnOptimize = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = true)
 
@@ -417,11 +417,156 @@ class OptimizeConflictReconciliationSuite extends QueryTest
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Reverse direction (optimize.conflictReconciliation.reverse.enabled): the DML LOSES to a
+  // compaction OPTIMIZE and remaps its deletion vector onto the winner's compacted output.
+  // ---------------------------------------------------------------------------
+
+  private val reverseKey =
+    DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED.key
+
+  /** A transaction with reverse reconciliation enabled (needed on both the OPTIMIZE and the DML). */
+  private def reverseTxn(sqlText: String, extraConf: Seq[(String, String)] = Nil): () => Array[Row] =
+    sqlTxn(sqlText, reconcile = false, (reverseKey -> "true") +: extraConf)
+
+  test("reverse: a losing DELETE remaps its DV onto the winning compaction output") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // A (loser): DELETE id=150. B (winner): OPTIMIZE compacts all files (persisting composition).
+      // A's target file is compacted away; instead of aborting, A remaps its delete onto the output.
+      val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
+      val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)}")
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnDelete, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      ThreadUtils.awaitResult(futureA, Duration.Inf)
+
+      // Both committed: id=150 gone, everything else present, compacted to one file carrying the
+      // remapped DV (cardinality 1) -- proving the DELETE reconciled rather than aborting.
+      assert(ids(dir) === (0L until 300L).filterNot(_ == 150L))
+      val files = log.update().allFiles.collect()
+      assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
+      assert(deletionVectorCardinalities(log) === Seq(1L),
+        "compacted output should carry the losing delete's remapped DV")
+    }
+  }
+
+  test("reverse: losing DELETE remaps correctly across an OPTIMIZE-time read gap") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // Pre-existing DV: id=100 (physical row 0 of the middle file) is deleted before either txn, so
+      // the OPTIMIZE excludes it from the output and the middle file's live rows start at physical
+      // index 1. The losing delete of id=150 (physical row 50) must land at live-rank 50-1=49 plus
+      // the first file's 100 rows -> output position 149, discounting the OPTIMIZE-time gap.
+      sql(s"DELETE FROM ${tableRef(dir)} WHERE id = 100")
+      assert(deletionVectorCardinalities(log) === Seq(1L), "pre-existing DV expected on one file")
+
+      val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
+      val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)}")
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnDelete, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      ThreadUtils.awaitResult(futureA, Duration.Inf)
+
+      // If the gap discount were wrong, a different physical row would be masked and a different id
+      // would go missing, so the exact surviving set validates the remap arithmetic.
+      assert(ids(dir) === (0L until 300L).filterNot(x => x == 100L || x == 150L))
+      val files = log.update().allFiles.collect()
+      assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
+      // The pre-existing id=100 was purged by the compaction (not in the output); the output DV
+      // carries only the losing delete of id=150.
+      assert(deletionVectorCardinalities(log) === Seq(1L),
+        "compacted output DV should carry only the remapped losing delete (id=150)")
+    }
+  }
+
+  test("reverse: a losing UPDATE remaps its DV onto the winning compaction output") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // The UPDATE masks the old row (a DV, which is remapped onto the output) and appends the new
+      // value in a fresh image file (a new AddFile the OPTIMIZE never touched, so it does not
+      // conflict). A (loser): UPDATE; B (winner): OPTIMIZE.
+      val txnUpdate = reverseTxn(s"UPDATE ${tableRef(dir)} SET id = id + 1000 WHERE id = 150")
+      val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)}")
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnUpdate, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      ThreadUtils.awaitResult(futureA, Duration.Inf)
+
+      // Old id=150 masked, new id=1150 present, everything else intact.
+      assert(ids(dir) === ((0L until 300L).filterNot(_ == 150L) :+ 1150L).sorted)
+      // The compacted output carries the remapped DV (cardinality 1); the fresh image file has none.
+      assert(deletionVectorCardinalities(log) === Seq(1L),
+        "compacted output should carry the remapped DV for the updated row")
+    }
+  }
+
+  test("reverse: aborts when the winning OPTIMIZE recorded no composition") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // The winning OPTIMIZE runs with reconciliation disabled in BOTH directions, so it captures
+      // and persists no source composition (mirroring a writer/engine that doesn't record it). The
+      // losing DELETE finds no tag on the compacted-away file and aborts -- reconciliation is
+      // reader-optional and abort-safe. The two txns share one SparkSession, so the OPTIMIZE pins
+      // both flags OFF explicitly, otherwise the DML's flags would leak onto its conf read.
+      val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
+      val txnOptimize = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = false,
+        extraConf = Seq(reverseKey -> "false"))
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnDelete, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      val e = intercept[SparkException] { ThreadUtils.awaitResult(futureA, Duration.Inf) }
+      assertConcurrentModificationException(e)
+      assert(ids(dir) === (0L until 300L))
+      assert(log.update().allFiles.collect().length === 1)
+    }
+  }
+
+  test("reverse: aborts against a reclustering (ZORDER) winner") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // ZORDER permutes rows, so the OPTIMIZE captures no composition even with the reverse flag on;
+      // the losing DML cannot remap (no offset mapping exists) and aborts.
+      val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
+      val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)} ZORDER BY (id)")
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnDelete, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      val e = intercept[SparkException] { ThreadUtils.awaitResult(futureA, Duration.Inf) }
+      assertConcurrentModificationException(e)
+      assert(ids(dir) === (0L until 300L))
+    }
+  }
+
+  test("reverse: aborts when a losing full-file delete cannot be remapped (mixed full/partial)") {
+    withTempDir { dir =>
+      val log = createMultiFileTable(dir)
+      // The losing DML both FULLY deletes one source file (id < 100 -> a bare RemoveFile with no
+      // re-added DV'd AddFile) and PARTIALLY deletes another (id = 150 -> RemoveFile + DV'd
+      // AddFile). The winning OPTIMIZE compacts all three files away. The partial delete is
+      // remappable, but the full delete has no DV to remap onto the output; reconciling only the
+      // partial one while blanket-resolving every compaction source would silently drop the full
+      // delete (ids 0-99 would resurface). H1 forces an abort: no DML-touched winner-removed source
+      // may be left un-remapped.
+      val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id < 100 OR id = 150")
+      val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)}")
+
+      val (futureA, futureB) = runTxnsWithOrder__A_Start__B__A_End(txnDelete, txnOptimize)
+      ThreadUtils.awaitResult(futureB, Duration.Inf)
+      val e = intercept[SparkException] { ThreadUtils.awaitResult(futureA, Duration.Inf) }
+      assertConcurrentModificationException(e)
+      // The DML aborted, so the winner's compaction stands unchanged: every row still present in
+      // the single compacted output, no rows lost.
+      assert(ids(dir) === (0L until 300L))
+      assert(log.update().allFiles.collect().length === 1)
+    }
+  }
+
   // --- Composition-tag parser ---
-  // The reconcile path reads the source composition through the shared parser
+  // Both reconcile directions read the source composition through the shared parser
   // `ConflictChecker.parseOptimizeSourceComposition`, which decodes the `compactedInto` /
-  // `compactionInfo` tags (a format shared with Databricks Runtime, so a foreign OPTIMIZE
-  // reconciles too). These unit-test the parser directly; the end-to-end remap that consumes its
+  // `compactionInfo` tags (a format modeled on Databricks Runtime's; cross-engine reconciliation is
+  // best-effort). These unit-test the parser directly; the end-to-end remap that consumes its
   // `(outputPath, outputStart, liveCount)` output is covered by the tests above.
 
   private def removeWithTags(tags: Map[String, String], dvCardinality: Long = 0L): RemoveFile = {

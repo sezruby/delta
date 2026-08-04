@@ -563,6 +563,21 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(false)
 
+  val DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED =
+    buildConf("optimize.conflictReconciliation.reverse.enabled")
+      .internal()
+      .doc(
+        """The reverse direction of optimize.conflictReconciliation.enabled: when a row-level DML
+          |(DELETE/UPDATE) LOSES to a concurrent compaction OPTIMIZE that removed the files it
+          |touched, reconcile instead of aborting by remapping the DML's deletion vector onto the
+          |winner's compacted output. Requires the OPTIMIZE to have persisted its per-output source
+          |composition (this flag also enables that persistence); if absent, or if the winner
+          |is not a pure compaction, the DML aborts as it does today. Compaction only; only active
+          |when deletion vectors are writable. Must be enabled on both the OPTIMIZE and the DML
+          |sessions for reconciliation to engage.""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")
       .doc("The default writer protocol version to create new tables with, unless a feature " +
