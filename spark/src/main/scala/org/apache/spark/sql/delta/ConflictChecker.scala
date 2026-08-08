@@ -80,9 +80,10 @@ private[delta] case class CurrentTransactionInfo(
    *
    * TODO: We might want to cluster all non-file actions at the front, for similar reasons.
    */
-  // Nothing to strip: the OPTIMIZE `compactedInto` / `compactionInfo` composition tags on a removed
-  // source's tombstone are persisted (as Databricks Runtime persists them), so a concurrent DML
-  // that LOSES to this OPTIMIZE can read the composition from the committed tombstone.
+  // The OPTIMIZE source-composition tags (`compactedInto` / `compactionInfo` on each removed
+  // source's tombstone) are persisted to the log, as Databricks Runtime does: they are consumed
+  // in-memory when this OPTIMIZE loses to a concurrent DML, and read from the committed tombstone
+  // when a concurrent DML loses to this OPTIMIZE. Nothing to strip.
   lazy val finalActionsToCommit: Seq[Action] = commitInfo ++: actions
 
   private var newMetadata: Option[Metadata] = None
@@ -317,6 +318,11 @@ private[delta] class ConflictChecker(
     // each removed source file onto the compacted output file (offset arithmetic) instead of
     // aborting. Compaction only; reclustering / already-DV'd sources / missing composition abort.
     resolveOptimizeConflicts()
+
+    // Reverse direction: the current txn is the row-level DML and the WINNER is a compaction
+    // OPTIMIZE that removed the files the DML touched. Remap the DML's deletion vector onto the
+    // winner's compacted output(s) instead of aborting. Runs before the file-level checks below.
+    resolveReverseOptimizeConflicts()
 
     // Data file checks.
     checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn()
@@ -1566,8 +1572,8 @@ private[delta] object ConflictChecker extends DeltaLogging {
    * Parse the composition a compaction OPTIMIZE recorded on a removed source `r`'s tombstone,
    * normalized to `(outputPath, outputStart, liveCount)`: `r`'s `liveCount` live rows landed
    * contiguously at output positions `[outputStart, outputStart + liveCount)` of `outputPath`, in
-   * physical order. Used by [[ConflictChecker.resolveOptimizeConflicts]] to remap a concurrent
-   * deletion vector onto the output.
+   * physical order. Used by [[ConflictChecker.resolveOptimizeConflicts]] and
+   * [[ConflictChecker.resolveReverseOptimizeConflicts]] to remap a deletion vector onto the output.
    *
    * Reads the `compactedInto` / `compactionInfo` tags (see [[RemoveFile.Tags.COMPACTION_INFO]]), a
    * format modeled on Databricks Runtime's (cross-engine reconciliation is best-effort, not a

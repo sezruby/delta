@@ -528,6 +528,11 @@ class OptimizeExecutor(
     // only, never clustering (a clustering pass permutes rows, so no offset mapping exists).
     val reconcileEnabled = sparkSession.sessionState.conf
       .getConf(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED)
+    // The reverse direction (a concurrent DML that LOSES to this OPTIMIZE remaps its DV onto the
+    // output) reads the source composition from the committed output, so it must be captured here
+    // and persisted below. Either direction needs the same capture.
+    val reverseReconcileEnabled = sparkSession.sessionState.conf
+      .getConf(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED)
     val useRepartition = sparkSession.sessionState.conf
       .getConf(DeltaSQLConf.DELTA_OPTIMIZE_REPARTITION_ENABLED)
     // Capture the source composition only on the coalesce path for compaction: coalesce
@@ -535,7 +540,7 @@ class OptimizeExecutor(
     // (observed, not imposed -- no sort, no helper column) and row-range offsets exist.
     // Repartition shuffles rows and a clustering pass permutes them, so neither is captured.
     val captureReconcile =
-      reconcileEnabled && !isMultiDimClustering && !useRepartition
+      (reconcileEnabled || reverseReconcileEnabled) && !isMultiDimClustering && !useRepartition
 
     // Read the bin. The reconcile-capture path pins the read so each source file lands whole in
     // one contiguous run (see readCompactionSourceWithWholeFilePins); vanilla OPTIMIZE just reads

@@ -81,7 +81,10 @@ trait RowLevelConcurrencyResolution extends DeltaLogging { self: ConflictChecker
    * enabled, by conflict-time data skipping over their stats).
    */
   protected def canSkipAddedFileForRowLevelConcurrency(addFile: AddFile): Boolean = {
-    if (!rowLevelConcurrencyEnabled) return false
+    // The reverse OPTIMIZE remap (resolveReverseOptimizeConflicts, in the sibling reconciliation
+    // trait) also records the winner's compaction outputs here: they are dataChange=false
+    // relocations the current DML's read is invariant to, so they must not re-trigger the check.
+    if (!rowLevelConcurrencyEnabled && !optimizeReverseReconciliationEnabled) return false
     rowLevelResolvedPaths.contains(addFile.path)
   }
 
