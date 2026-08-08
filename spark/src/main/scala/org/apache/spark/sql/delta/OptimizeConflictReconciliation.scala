@@ -300,7 +300,10 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
     val sharedPaths = currentAddByPath.keySet.intersect(currentRemoveByPath.keySet)
     if (sharedPaths.isEmpty) return
 
-    recordTime("resolved-reverse-optimize-conflicts") {
+    // Reconcile is a pure optimization over the conservative abort: mutate the transaction only
+    // on the success path below, so any DV read/merge/write failure leaves it untouched and the
+    // standard file-level checks abort cleanly rather than surfacing an unexpected error.
+    try recordTime("resolved-reverse-optimize-conflicts") {
       val dvStore = DeletionVectorStore.createInstance(deltaLog.newDeltaHadoopConf())
       val tablePath = deltaLog.dataPath
 
@@ -407,6 +410,10 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
             "outputsRemapped" -> cAdds.size,
             "winningOperation" -> winningOperationName.getOrElse("UNKNOWN")))
       }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(log"reverse OPTIMIZE-vs-DML conflict reconciliation failed; leaving all " +
+          log"conflicts for the standard checks to arbitrate", e)
     }
   }
 }
