@@ -19,6 +19,7 @@ package org.apache.spark.sql.delta.commands
 import java.util.ConcurrentModificationException
 
 import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
 
 import org.apache.spark.sql.delta.skipping.MultiDimClustering
 import org.apache.spark.sql.delta.skipping.clustering.{ClusteredTableUtils, ClusteringColumnInfo}
@@ -667,7 +668,7 @@ class OptimizeExecutor(
     def untagged: Seq[RemoveFile] =
       bin.map(_.removeWithTimestamp(operationTimestamp, dataChange = false))
 
-    captureAccOpt match {
+    try captureAccOpt match {
       case Some(acc) if addFiles.size == 1 && acc.value.size() == 1 &&
           bin.forall(_.numLogicalRecords.isDefined) =>
         val runs = acc.value.get(0)
@@ -720,6 +721,14 @@ class OptimizeExecutor(
           untagged
         }
       case _ =>
+        untagged
+    } catch {
+      case NonFatal(e) =>
+        // Composition capture is a pure optimization enabler, never required for OPTIMIZE
+        // correctness: on any failure building the tags (an unmappable source path, a
+        // serialization error) fall back to plain untagged tombstones so the already-written
+        // OPTIMIZE still commits and a concurrent loser aborts exactly as it does today.
+        logWarning(log"Compaction composition capture failed; writing untagged tombstones", e)
         untagged
     }
   }
