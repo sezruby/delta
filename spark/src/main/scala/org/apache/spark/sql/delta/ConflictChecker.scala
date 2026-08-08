@@ -20,6 +20,7 @@ package org.apache.spark.sql.delta
 import java.util.concurrent.TimeUnit
 
 import scala.collection.mutable
+import scala.util.Try
 
 import org.apache.spark.sql.delta.DeltaOperations.{OP_SET_TBLPROPERTIES, ROW_TRACKING_BACKFILL_OPERATION_NAME, ROW_TRACKING_UNBACKFILL_OPERATION_NAME}
 import org.apache.spark.sql.delta.RowId.RowTrackingMetadataDomain
@@ -31,6 +32,7 @@ import org.apache.spark.sql.delta.sources.DeltaSourceUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.util.DeltaSparkPlanUtils.CheckDeterministicOptions
 import org.apache.spark.sql.delta.util.FileNames
+import org.apache.spark.sql.delta.util.JsonUtils
 import io.delta.storage.commit.UpdatedActions
 import io.delta.storage.commit.uccommitcoordinator.UCCommitCoordinatorClient
 import io.delta.storage.commit.uniform.UniformMetadata
@@ -78,6 +80,9 @@ private[delta] case class CurrentTransactionInfo(
    *
    * TODO: We might want to cluster all non-file actions at the front, for similar reasons.
    */
+  // Nothing to strip: the OPTIMIZE `compactedInto` / `compactionInfo` composition tags on a removed
+  // source's tombstone are persisted (as Databricks Runtime persists them), so a concurrent DML
+  // that LOSES to this OPTIMIZE can read the composition from the committed tombstone.
   lazy val finalActionsToCommit: Seq[Action] = commitInfo ++: actions
 
   private var newMetadata: Option[Metadata] = None
@@ -221,7 +226,8 @@ private[delta] class ConflictChecker(
     protected val winningCommitSummary: WinningCommitSummary,
     isolationLevel: IsolationLevel)
   extends DeltaLogging with ConflictCheckerPredicateElimination
-  with RowLevelConcurrencyResolution {
+  with RowLevelConcurrencyResolution
+  with OptimizeConflictReconciliation {
 
   protected val winningCommitVersion = winningCommitSummary.commitVersion
   protected val startTimeMs = System.currentTimeMillis()
@@ -306,6 +312,11 @@ private[delta] class ConflictChecker(
     // the same file no longer aborts. Runs after row-ID reassignment so merged files keep stable
     // base row IDs.
     resolveRowLevelConflicts()
+
+    // Compaction OPTIMIZE vs concurrent row-level DML: remap the concurrent deletion vector from
+    // each removed source file onto the compacted output file (offset arithmetic) instead of
+    // aborting. Compaction only; reclustering / already-DV'd sources / missing composition abort.
+    resolveOptimizeConflicts()
 
     // Data file checks.
     checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn()
@@ -1550,6 +1561,48 @@ private[delta] class ConflictChecker(
 }
 
 private[delta] object ConflictChecker extends DeltaLogging {
+
+  /**
+   * Parse the composition a compaction OPTIMIZE recorded on a removed source `r`'s tombstone,
+   * normalized to `(outputPath, outputStart, liveCount)`: `r`'s `liveCount` live rows landed
+   * contiguously at output positions `[outputStart, outputStart + liveCount)` of `outputPath`, in
+   * physical order. Used by [[ConflictChecker.resolveOptimizeConflicts]] to remap a concurrent
+   * deletion vector onto the output.
+   *
+   * Reads the `compactedInto` / `compactionInfo` tags (see [[RemoveFile.Tags.COMPACTION_INFO]]), a
+   * format modeled on Databricks Runtime's (cross-engine reconciliation is best-effort, not a
+   * verified guarantee). `sourceNumPhysicalRecords` is a PHYSICAL count; the live count is derived
+   * here as
+   * `physical - |Do|`, where `|Do|` (the OPTIMIZE-read DV) is the cardinality carried on this same
+   * tombstone (`r.deletionVector`).
+   *
+   * Returns None -- so the caller falls back to today's abort, never a wrong result -- when the
+   * tags are absent, malformed, point at an output not in `outputPaths`, or describe a source split
+   * across more than one output run, which the contiguous offset remap does not model.
+   */
+  private[delta] def parseOptimizeSourceComposition(
+      r: RemoveFile,
+      outputPaths: Set[String]): Option[(String, Long, Long)] = Try {
+    (r.getTag(RemoveFile.Tags.COMPACTED_INTO), r.getTag(RemoveFile.Tags.COMPACTION_INFO)) match {
+      case (Some(intoJson), Some(infoJson)) =>
+        val outputs = JsonUtils.fromJson[Seq[String]](intoJson)
+        val entries = JsonUtils.fromJson[Seq[CompactionInfoEntry]](infoJson)
+        (outputs, entries) match {
+          case (Seq(outputPath), Seq(entry))
+              if outputPaths.contains(outputPath) &&
+                entry.rowOffsetInTarget.isDefined && entry.sourceNumPhysicalRecords.isDefined =>
+            // Physical count -> live count via the read-time DV cardinality carried on this
+            // tombstone. Single-run only (one output, one entry); anything else -> None.
+            val readTimeDvCardinality =
+              Option(r.deletionVector).map(_.cardinality).getOrElse(0L)
+            Some((outputPath, entry.rowOffsetInTarget.get,
+              entry.sourceNumPhysicalRecords.get - readTimeDvCardinality))
+          case _ => None
+        }
+      case _ => None
+    }
+  }.toOption.flatten
+
   /**
    * Returns an iterator that validates all [[AddFile]] and [[RemoveFile]] actions in
    * `actions` share a consistent `dataChange` value. [[AddCDCFile]] is excluded because
