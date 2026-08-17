@@ -547,6 +547,22 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(false)
 
+  val DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_ENABLED =
+    buildConf("optimize.conflictReconciliation.enabled")
+      .internal()
+      .doc(
+        """When enabled, a compaction OPTIMIZE that conflicts with a concurrent row-level DML
+          |(DELETE/UPDATE) reconciles instead of aborting: it remaps the concurrent deletion
+          |vector from each removed source file onto the compacted output file by offset
+          |arithmetic (output position = source-file offset + physical row index) and unions it
+          |into the output's deletion vector. Compaction only (order-preserving); reclustering, and
+          |sources that already carried a deletion vector at read time, are left to abort. Relies on
+          |the OPTIMIZE having recorded per-output source composition; if absent (e.g. a native
+          |write bypassed it) the conflict aborts. Only active when deletion vectors are
+          |writable.""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")
       .doc("The default writer protocol version to create new tables with, unless a feature " +

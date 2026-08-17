@@ -61,12 +61,12 @@ object DeltaFileFormatWriter extends Logging {
    * A variable used in tests to check whether the output ordering of the query matches the
    * required ordering of the write command.
    */
-  private var outputOrderingMatched: Boolean = false
+  private[delta] var outputOrderingMatched: Boolean = false
 
   /**
    * A variable used in tests to check the final executed plan.
    */
-  private var executedPlan: Option[SparkPlan] = None
+  private[delta] var executedPlan: Option[SparkPlan] = None
 
   // scalastyle:off argcount
   /**
