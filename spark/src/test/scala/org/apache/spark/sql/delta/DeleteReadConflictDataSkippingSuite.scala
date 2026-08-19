@@ -22,21 +22,26 @@ import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 
-import org.apache.spark.sql.{QueryTest, Row, SaveMode}
+import org.apache.spark.sql.{QueryTest, SaveMode}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, Expression, GreaterThanOrEqual, LessThan, Literal, Remainder}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.LongType
 
 /**
  * Tests for the delete/read row-level refinement of conflict detection (row-level concurrency
- * Case 1b, [[DeltaSQLConf.DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED]]).
+ * Case 1b), which rides on the value-exact conflict-skipping flags
+ * ([[DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED]] +
+ * [[DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED]]).
  *
  * The path-keyed delete/read check aborts the current transaction whenever a file the winner
  * removed is in the current transaction's read set, regardless of whether the removed rows actually
  * match what it read. This refinement reads the rows the winner ACTUALLY removed and conflicts only
  * when one matches the read predicate. It is the delete/read analogue of the value-exact
  * added-files skipping in [[ConflictDataSkippingSuite]]; it must be one-way safe (abort unless the
- * removed rows are proven not to match) and fail-safe (any error keeps today's abort).
+ * removed rows are proven not to match) and fail-safe (any error keeps today's abort). A companion
+ * fix excludes a merge-on-read re-add (a path in both the winner's added and removed sets) from the
+ * added-files check, since it carries no new rows -- otherwise a reader disjoint from the removed
+ * rows would still abort on the added-files arm.
  */
 class DeleteReadConflictDataSkippingSuite extends QueryTest
   with SharedSparkSession
@@ -184,7 +189,8 @@ class DeleteReadConflictDataSkippingSuite extends QueryTest
         .write.format("delta").mode("append").save(path)
       val log = DeltaLog.forTable(spark, path)
       withSQLConf(
-          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED.key ->
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED.key -> enabled.toString,
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED.key ->
             enabled.toString) {
         val loser = log.startTransaction()
         val readFiles = loser.filterFiles(Seq(readPredicate))
@@ -230,7 +236,8 @@ class DeleteReadConflictDataSkippingSuite extends QueryTest
         .write.format("delta").mode("append").save(path)
       val log = DeltaLog.forTable(spark, path)
       withSQLConf(
-          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED.key -> "true") {
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED.key -> "true",
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED.key -> "true") {
         val loser = log.startTransaction()
         loser.readWholeTable()
         sql(s"DELETE FROM ${tableRef(dir)} WHERE id >= 0")
@@ -240,5 +247,59 @@ class DeleteReadConflictDataSkippingSuite extends QueryTest
         }
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Combined merge-on-read tests: a real DELETE winner that re-adds the file with a wider deletion
+  // vector, exercising both arms together. The re-added file's live rows still match a disjoint
+  // reader's predicate, so without the added-files re-add exclusion the reader would abort on the
+  // ADD arm (ConcurrentAppendException) and never reach the row-level delete/read refinement.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Reader loser scans a DV-enabled single file under `readPredicate` while a winner deletes
+   * `[0, 10)` via a merge-on-read deletion vector (RemoveFile(P, oldDV) + AddFile(P, newDV)).
+   * Returns "committed", "append-conflict" or "deleteread-conflict".
+   */
+  private def runMoRDeleteRace(readPredicate: Expression): String = {
+    var outcome = "committed"
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(0, 100).repartition(1)
+        .write.format("delta").mode("append").save(path)
+      sql(s"ALTER TABLE ${tableRef(dir)} SET TBLPROPERTIES " +
+        s"('delta.enableDeletionVectors' = 'true')")
+      val log = DeltaLog.forTable(spark, path)
+      withSQLConf(
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED.key -> "true",
+          DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED.key -> "true") {
+        val loser = log.startTransaction()
+        loser.filterFiles(Seq(readPredicate))
+        sql(s"DELETE FROM ${tableRef(dir)} WHERE id < 10")
+        outcome =
+          try {
+            loser.commit(
+              Seq(manufacturedAdd("loser.parquet")), DeltaOperations.Write(SaveMode.Append))
+            "committed"
+          } catch {
+            case _: io.delta.exceptions.ConcurrentAppendException => "append-conflict"
+            case _: io.delta.exceptions.ConcurrentDeleteReadException => "deleteread-conflict"
+          }
+      }
+    }
+    outcome
+  }
+
+  test("e2e MoR: reader disjoint from removed rows commits (add-arm re-add is not new data)") {
+    // Winner removed [0, 10); the re-added file's live rows [10, 100) include the read range, but
+    // they are not new data, so the reader must commit rather than hit ConcurrentAppendException.
+    assert(runMoRDeleteRace(ge(50)) == "committed",
+      "removed rows [0, 10) are disjoint from the read id >= 50 -> loser commits")
+  }
+
+  test("e2e MoR: reader overlapping the removed rows aborts with delete/read") {
+    // Winner removed [0, 10); the reader read id < 5, which a removed row satisfies.
+    assert(runMoRDeleteRace(lt(5)) == "deleteread-conflict",
+      "removed rows [0, 10) intersect the read id < 5 -> delete/read conflict")
   }
 }

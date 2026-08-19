@@ -555,25 +555,18 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
           |transaction's read predicates. This resolves predicates min/max stats cannot skip (e.g.
           |modulo or other non-range expressions), at the cost of reading the (already stats-
           |narrowed) added files during commit. One-way safe: a file is excluded only when an actual
-          |scan proves no row matches.""".stripMargin)
-      .booleanConf
-      .createWithDefault(false)
-
-  val DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED =
-    buildConf("conflictDetection.deleteReadDataSkipping.enabled")
-      .internal()
-      .doc(
-        """When enabled, conflict detection refines the delete/read check: instead of aborting
-          |whenever a concurrently-removed file's path is in the current transaction's read set, it
-          |reads the rows the winning transaction actually removed from those files and conflicts
-          |only when a removed row matches the current transaction's read predicates. The removed
-          |rows are obtained without an inverse deletion-vector read: because the winner's new
-          |deletion vector is a superset of the pre-image one, the count of predicate-matching
-          |removed rows equals matches(pre-image live view) - matches(post-image live view), so two
-          |ordinary reads of the (few) overlapping files suffice. This is the delete/read analogue
-          |of conflictDetection.dataSkipping.valueExact.enabled. One-way safe: the loser aborts
-          |unless the removed rows are proven not to match; any error or missing information falls
-          |back to today's path-keyed abort.""".stripMargin)
+          |scan proves no row matches.
+          |
+          |This flag additionally refines the delete/read check with the same read-the-data
+          |approach: a merge-on-read file the winner removed and re-added at the same path carries
+          |no new rows, so it is excluded from the added-files check, and the delete/read check
+          |aborts only when a row the winner actually removed matches the current transaction's read
+          |predicates. The removed rows are obtained without an inverse deletion-vector read:
+          |because the winner's new deletion vector is a superset of the pre-image one, the count of
+          |predicate-matching removed rows equals matches(pre-image live view) - matches(post-image
+          |live view), so two ordinary reads of the (few) overlapping files suffice. One-way safe:
+          |the loser aborts unless the removed rows are proven not to match; any error or missing
+          |information falls back to the path-keyed abort.""".stripMargin)
       .booleanConf
       .createWithDefault(false)
 

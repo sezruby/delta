@@ -1149,6 +1149,17 @@ private[delta] class ConflictChecker(
   }
 
   /**
+   * Whether the row-level concurrency delete/read refinement (Case 1b) is active. It reads data
+   * during conflict detection, so it rides on the value-exact added-files skipping flags rather
+   * than a separate config: when on, a merge-on-read file the winner removed and re-added at the
+   * same path is excluded from the added-files check (it carries no new rows), and the delete/read
+   * check aborts only when a row the winner actually removed matches what the transaction read.
+   */
+  private def deleteReadRowLevelRefinementEnabled: Boolean =
+    spark.conf.get(DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED) &&
+      spark.conf.get(DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED)
+
+  /**
    * Check if the new files added by the already committed transactions should have been read by
    * the current transaction.
    */
@@ -1168,8 +1179,24 @@ private[delta] class ConflictChecker(
           Seq.empty
       }
 
+      // Row-level concurrency (Case 1b companion): a file the winner both removed and re-added at
+      // the same path is a merge-on-read modification (e.g. a DELETE that only widened its deletion
+      // vector), not new data -- its rows already existed in the current transaction's read
+      // snapshot, so it can never be a file the transaction "should have read but could not". The
+      // only conflict it can raise is delete/read, resolved row-level in
+      // checkForDeletedFilesAgainstCurrentTxnReadFiles; leaving it here would abort a reader
+      // disjoint from the removed rows with a spurious ConcurrentAppendException. Genuinely new
+      // rows from an UPDATE/MERGE land at a fresh path (not in removedFiles) and stay checked.
+      val addedFilesToCheck =
+        if (deleteReadRowLevelRefinementEnabled) {
+          val reAddedPaths = winningCommitSummary.removedFiles.map(_.path).toSet
+          addedFilesToCheckForConflicts.filterNot(a => reAddedPaths.contains(a.path))
+        } else {
+          addedFilesToCheckForConflicts
+        }
+
       val fileMatchingPartitionReadPredicates =
-        getFirstFileMatchingPartitionPredicates(addedFilesToCheckForConflicts)
+        getFirstFileMatchingPartitionPredicates(addedFilesToCheck)
 
       if (fileMatchingPartitionReadPredicates.nonEmpty) {
         throw DeltaErrors.concurrentAppendException(
@@ -1196,8 +1223,7 @@ private[delta] class ConflictChecker(
       // whole-table read / no read predicates, this keeps today's path-keyed abort over all
       // removed files.
       val candidateRemovedFiles =
-        if (spark.conf.get(
-              DeltaSQLConf.DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED) &&
+        if (deleteReadRowLevelRefinementEnabled &&
             !currentTransactionInfo.readWholeTable &&
             currentTransactionInfo.readPredicates.nonEmpty) {
           val overlap =
