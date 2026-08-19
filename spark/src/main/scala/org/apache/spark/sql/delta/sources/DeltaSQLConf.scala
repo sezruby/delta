@@ -559,6 +559,24 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(false)
 
+  val DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED =
+    buildConf("conflictDetection.deleteReadDataSkipping.enabled")
+      .internal()
+      .doc(
+        """When enabled, conflict detection refines the delete/read check: instead of aborting
+          |whenever a concurrently-removed file's path is in the current transaction's read set, it
+          |reads the rows the winning transaction actually removed from those files and conflicts
+          |only when a removed row matches the current transaction's read predicates. The removed
+          |rows are obtained without an inverse deletion-vector read: because the winner's new
+          |deletion vector is a superset of the pre-image one, the count of predicate-matching
+          |removed rows equals matches(pre-image live view) - matches(post-image live view), so two
+          |ordinary reads of the (few) overlapping files suffice. This is the delete/read analogue
+          |of conflictDetection.dataSkipping.valueExact.enabled. One-way safe: the loser aborts
+          |unless the removed rows are proven not to match; any error or missing information falls
+          |back to today's path-keyed abort.""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")
       .doc("The default writer protocol version to create new tables with, unless a feature " +

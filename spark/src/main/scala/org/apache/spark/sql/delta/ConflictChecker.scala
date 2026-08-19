@@ -1190,7 +1190,31 @@ private[delta] class ConflictChecker(
       // Fail if files have been deleted that the txn read.
       val readFilePaths = currentTransactionInfo.readFiles.map(
         f => f.path -> f.partitionValues).toMap
-      val deleteReadOverlap = winningCommitSummary.removedFiles
+      // Row-level refinement (Case 1b), the delete/read analogue of the added-files skipping in
+      // getFirstFileMatchingPartitionPredicates: of the removed files the txn read, drop those the
+      // winner removed no read-matching row from. Same guards as that skipping; when off / a
+      // whole-table read / no read predicates, this keeps today's path-keyed abort over all
+      // removed files.
+      val candidateRemovedFiles =
+        if (spark.conf.get(
+              DeltaSQLConf.DELTA_CONFLICT_DETECTION_DELETE_READ_DATA_SKIPPING_ENABLED) &&
+            !currentTransactionInfo.readWholeTable &&
+            currentTransactionInfo.readPredicates.nonEmpty) {
+          val overlap =
+            winningCommitSummary.removedFiles.filter(r => readFilePaths.contains(r.path))
+          val remaining = removedFilesWithReadMatchingRemovedRows(overlap)
+          if (remaining.size < overlap.size) {
+            recordDeltaEvent(deltaLog,
+              opType = "delta.conflictDetection.deleteReadDataSkipping.filesSkipped",
+              data = Map(
+                "candidateFiles" -> overlap.size,
+                "skippedFiles" -> (overlap.size - remaining.size)))
+          }
+          remaining
+        } else {
+          winningCommitSummary.removedFiles
+        }
+      val deleteReadOverlap = candidateRemovedFiles
         .find(r => readFilePaths.contains(r.path))
       if (deleteReadOverlap.nonEmpty) {
         val partitionOpt = getPrettyPartitionMessage(readFilePaths(deleteReadOverlap.get.path))
@@ -1207,6 +1231,56 @@ private[delta] class ConflictChecker(
           winningCommitVersion,
           partitionOpt = None)
       }
+    }
+  }
+
+  /**
+   * Row-level refinement of the delete/read check (row-level concurrency Case 1b): given the
+   * concurrently-removed files the current transaction read (`overlappingRemovedFiles`), returns
+   * those still in conflict -- i.e. the winner removed from them at least one row matching the
+   * transaction's read predicates. It is an all-or-nothing existence check, so the result is either
+   * every file (conflict) or none (the removed rows are proven not to match). The delete/read
+   * analogue of the value-exact added-files skipping in
+   * [[getFirstFileMatchingPartitionPredicates]].
+   *
+   * The removed rows are obtained without an inverse deletion-vector read: a `RemoveFile` carries
+   * the pre-image DV and the winner's paired re-added [[AddFile]] (if any) the post-image DV, and
+   * since a DML only adds deletions the post-image live rows are a subset of the pre-image ones, so
+   * matches(removed) = matches(pre-image live) - matches(post-image live). One-way safe and
+   * fail-safe: any missing information or error keeps every file as a conflict (the count check
+   * is `ConflictDataSkippingReader.anyRemovedRowMatchesReadPredicate`).
+   */
+  private def removedFilesWithReadMatchingRemovedRows(
+      overlappingRemovedFiles: Seq[RemoveFile]): Seq[RemoveFile] = {
+    if (overlappingRemovedFiles.isEmpty) return overlappingRemovedFiles
+    val readSnapshot = currentTransactionInfo.readSnapshot
+    // A partitioned removed file that did not record its partition values cannot be read back
+    // safely, so keep every file as a conflict.
+    if (readSnapshot.metadata.partitionColumns.nonEmpty &&
+        overlappingRemovedFiles.exists(_.partitionValues == null)) {
+      return overlappingRemovedFiles
+    }
+    // Pre-image view: each removed file under the DV it carried before removal. Post-image view:
+    // the winner's re-added file at the same path (absent for a full-file removal).
+    val preImageFiles = overlappingRemovedFiles.map(r =>
+      AddFile(
+        path = r.path,
+        partitionValues = Option(r.partitionValues).getOrElse(Map.empty),
+        size = r.size.getOrElse(0L),
+        modificationTime = 0L,
+        dataChange = false,
+        stats = r.stats,
+        tags = r.tags,
+        deletionVector = r.deletionVector))
+    val postImageFiles = overlappingRemovedFiles
+      .flatMap(r => winningCommitSummary.addedFilePathToActionMap.get(r.path))
+    if (readSnapshot.anyRemovedRowMatchesReadPredicate(
+        preImageFiles,
+        postImageFiles,
+        currentTransactionInfo.readPredicates.map(_.dataPredicates).toSeq)) {
+      overlappingRemovedFiles
+    } else {
+      Seq.empty
     }
   }
 

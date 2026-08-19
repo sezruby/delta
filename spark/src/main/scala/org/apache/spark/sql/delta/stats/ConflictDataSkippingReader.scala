@@ -276,6 +276,76 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
   }
 
   /**
+   * Delete/read conflict refinement (row-level concurrency Case 1b): decides whether any row the
+   * winning transaction REMOVED from the given files matches the current transaction's read
+   * predicates. The caller ([[org.apache.spark.sql.delta.ConflictChecker]]) uses this to replace
+   * the path-keyed delete/read abort with a row-level one -- a concurrently-removed file the
+   * transaction read is a genuine conflict only when a removed row actually matches what it read.
+   *
+   * Rather than reading the removed rows directly (which would need an inverse deletion-vector
+   * scan), we exploit that a DML only ever ADDS deletions: the winner's post-image deletion vector
+   * is a superset of the pre-image one, so its post-image live rows are a SUBSET of the pre-image
+   * live rows, and the removed rows are exactly their difference. Hence, for the read condition
+   * `cond` (OR across reads, AND within a read), summed over the overlapping files:
+   *
+   *   matches(removed) = matches(pre-image live rows) - matches(post-image live rows)
+   *
+   * `preImageFiles` are the removed files viewed under their pre-image DV (one [[AddFile]] per
+   * `RemoveFile`); `postImageFiles` are the winner's paired re-added [[AddFile]]s under their
+   * post-image DV (absent for a full-file removal, whose removed set is the whole pre-image). Every
+   * per-file term is non-negative (subset), so the total difference is >= 1 iff some removed row
+   * matches -- one pair of counts over the (few) overlapping files suffices, with no per-file
+   * attribution and no giant row-index predicate.
+   *
+   * One-way safe: returns true (conflict) unless the scan PROVES no removed row matches. A read
+   * with no eligible (deterministic, subquery-free, non-metadata) filter matches everything, so it
+   * cannot prove non-match and returns true. Any failure falls back to true (path-keyed abort).
+   */
+  private[delta] def anyRemovedRowMatchesReadPredicate(
+      preImageFiles: Seq[AddFile],
+      postImageFiles: Seq[AddFile],
+      dataFiltersPerRead: Seq[Seq[Expression]]): Boolean = {
+    if (preImageFiles.isEmpty || dataFiltersPerRead.isEmpty || schema.isEmpty) return true
+    try {
+      // AND within a read over its eligible filters; a read with none matches everything, so we
+      // cannot prove any removed row fails it -> conservative conflict.
+      val perReadEligible = dataFiltersPerRead.map(eligibleSkippingFilters)
+      if (perReadEligible.exists(_.isEmpty)) return true
+      val snapshot = snapshotToScan
+      val sc = spark.sparkContext
+      val prevJobDesc = sc.getLocalProperty(SparkContext.SPARK_JOB_DESCRIPTION)
+      val removedMatchCount =
+        try {
+          sc.setJobDescription("Delta conflict detection: delete/read row-level skipping")
+          recordFrameProfile("Delta", "DataSkippingReader.anyRemovedRowMatchesReadPredicate") {
+            // Count rows matching the read condition among the live rows of `files`. The condition
+            // is rebound to each freshly built DataFrame's columns (OR across reads, AND within).
+            def countMatchingLiveRows(files: Seq[AddFile]): Long = {
+              if (files.isEmpty) return 0L
+              val df = snapshot.deltaLog.createDataFrame(
+                snapshot, files, actionTypeOpt = Some("conflictDetectionDeleteRead"))
+              val condition = perReadEligible
+                .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
+                .reduce(_ || _)
+              df.where(condition).count()
+            }
+            countMatchingLiveRows(preImageFiles) - countMatchingLiveRows(postImageFiles)
+          }
+        } finally {
+          sc.setJobDescription(prevJobDesc)
+        }
+      removedMatchCount > 0
+    } catch {
+      case NonFatal(e) =>
+        // Optimization only: never let a scan failure abort or silently pass a commit. Fall back to
+        // the default (feature-off) behavior of treating the removed files as a conflict.
+        logWarning(log"Conflict-time delete/read row-level skipping failed to evaluate; falling " +
+          log"back to treating the removed files as a conflict", e)
+        true
+    }
+  }
+
+  /**
    * Rebinds `e`'s attribute references to `df`'s output columns by name, so a read predicate
    * resolved against the transaction's plan can be evaluated on a freshly built DataFrame. Nested
    * accesses (`GetStructField` over a top-level struct column) are preserved. If a referenced name
