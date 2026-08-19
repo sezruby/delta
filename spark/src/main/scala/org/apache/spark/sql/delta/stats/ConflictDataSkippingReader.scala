@@ -29,7 +29,7 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.functions.{col, from_json}
+import org.apache.spark.sql.functions.{coalesce, col, from_json, lit, sum}
 
 /**
  * Reader-side data skipping used during conflict detection (row-level concurrency Case 1: writers
@@ -294,8 +294,9 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
    * `RemoveFile`); `postImageFiles` are the winner's paired re-added [[AddFile]]s under their
    * post-image DV (absent for a full-file removal, whose removed set is the whole pre-image). Every
    * per-file term is non-negative (subset), so the total difference is >= 1 iff some removed row
-   * matches -- one pair of counts over the (few) overlapping files suffices, with no per-file
-   * attribution and no giant row-index predicate.
+   * matches. The two images are unioned with signed weights (+1 pre, -1 post) and summed in a
+   * SINGLE Spark job over the (few) overlapping files, with no per-file attribution and no giant
+   * row-index predicate.
    *
    * One-way safe: returns true (conflict) unless the scan PROVES no removed row matches. A read
    * with no eligible (deterministic, subquery-free, non-metadata) filter matches everything, so it
@@ -318,18 +319,25 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
         try {
           sc.setJobDescription("Delta conflict detection: delete/read row-level skipping")
           recordFrameProfile("Delta", "DataSkippingReader.anyRemovedRowMatchesReadPredicate") {
-            // Count rows matching the read condition among the live rows of `files`. The condition
+            // Rows of `files` matching the read condition, tagged with `weight` so a single
+            // aggregation over the union yields the signed pre-minus-post difference. The condition
             // is rebound to each freshly built DataFrame's columns (OR across reads, AND within).
-            def countMatchingLiveRows(files: Seq[AddFile]): Long = {
-              if (files.isEmpty) return 0L
+            def matchingRowWeights(files: Seq[AddFile], weight: Long): DataFrame = {
               val df = snapshot.deltaLog.createDataFrame(
                 snapshot, files, actionTypeOpt = Some("conflictDetectionDeleteRead"))
               val condition = perReadEligible
                 .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
                 .reduce(_ || _)
-              df.where(condition).count()
+              df.where(condition).select(lit(weight).as("weight"))
             }
-            countMatchingLiveRows(preImageFiles) - countMatchingLiveRows(postImageFiles)
+            // matches(removed) = matches(pre-image live) - matches(post-image live), evaluated in a
+            // SINGLE Spark job: union the per-image weighted matches (+1 pre, -1 post) and sum. A
+            // full-file removal has no post-image, so the pre-image count alone is the removed set.
+            val weights =
+              if (postImageFiles.isEmpty) matchingRowWeights(preImageFiles, 1L)
+              else matchingRowWeights(preImageFiles, 1L)
+                .union(matchingRowWeights(postImageFiles, -1L))
+            weights.select(coalesce(sum(col("weight")), lit(0L))).head().getLong(0)
           }
         } finally {
           sc.setJobDescription(prevJobDesc)
