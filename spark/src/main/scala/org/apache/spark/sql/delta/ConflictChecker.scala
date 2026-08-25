@@ -216,11 +216,13 @@ object WinningCommitSummary {
 }
 
 private[delta] class ConflictChecker(
-    spark: SparkSession,
+    protected val spark: SparkSession,
     initialCurrentTransactionInfo: CurrentTransactionInfo,
-    winningCommitSummary: WinningCommitSummary,
+    protected val winningCommitSummary: WinningCommitSummary,
     isolationLevel: IsolationLevel)
-  extends DeltaLogging with ConflictCheckerPredicateElimination {
+  extends DeltaLogging
+  with ConflictCheckerPredicateElimination
+  with ConflictCheckerDataSkipping {
 
   protected val winningCommitVersion = winningCommitSummary.commitVersion
   protected val startTimeMs = System.currentTimeMillis()
@@ -300,7 +302,8 @@ private[delta] class ConflictChecker(
     // Update the table version in newly added type widening metadata.
     updateTypeWideningMetadata()
 
-    // Data file checks.
+    // Data file checks. Start the delete/read scan so it overlaps the added-files scan below.
+    maybeStartDeleteReadRowScan()
     checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn()
     checkForDeletedFilesAgainstCurrentTxnReadFiles()
     checkForDeletedFilesAgainstCurrentTxnDeletedFiles()
@@ -1168,8 +1171,24 @@ private[delta] class ConflictChecker(
           Seq.empty
       }
 
+      // A file the winner both removed and re-added at the same path is a merge-on-read
+      // modification (e.g. a DELETE that only widened its deletion vector), not new data -- its
+      // rows already existed in the current transaction's read snapshot, so it can never be a file
+      // the transaction "should have read but could not". The only conflict it can raise is
+      // delete/read, resolved row-level in checkForDeletedFilesAgainstCurrentTxnReadFiles; leaving
+      // it here would abort a reader disjoint from the removed rows with a spurious
+      // ConcurrentAppendException. Genuinely new rows from an UPDATE/MERGE land at a fresh path
+      // (not in removedFiles) and stay checked.
+      val addedFilesToCheck =
+        if (deleteReadRowLevelRefinementEnabled) {
+          val reAddedPaths = winningCommitSummary.removedFiles.map(_.path).toSet
+          addedFilesToCheckForConflicts.filterNot(a => reAddedPaths.contains(a.path))
+        } else {
+          addedFilesToCheckForConflicts
+        }
+
       val fileMatchingPartitionReadPredicates =
-        getFirstFileMatchingPartitionPredicates(addedFilesToCheckForConflicts)
+        getFirstFileMatchingPartitionPredicates(addedFilesToCheck)
 
       if (fileMatchingPartitionReadPredicates.nonEmpty) {
         throw DeltaErrors.concurrentAppendException(
@@ -1190,8 +1209,28 @@ private[delta] class ConflictChecker(
       // Fail if files have been deleted that the txn read.
       val readFilePaths = currentTransactionInfo.readFiles.map(
         f => f.path -> f.partitionValues).toMap
-      val deleteReadOverlap = winningCommitSummary.removedFiles
-        .find(r => readFilePaths.contains(r.path))
+      // The row-level analogue of the added-files skipping in
+      // getFirstFileMatchingPartitionPredicates: when enabled and the read is neither whole-table
+      // nor empty-predicate, suppress the abort if the winner removed no read-matching row from the
+      // overlapping files (deleteReadRowMatches scans their removed rows). Otherwise this stays the
+      // original path-keyed abort over the first removed file the transaction read.
+      val overlappingRemovedFiles = readOverlappingRemovedFiles
+      val deleteReadOverlap =
+        if (deleteReadRowLevelRefinementEnabled &&
+            !currentTransactionInfo.readWholeTable &&
+            currentTransactionInfo.readPredicates.nonEmpty &&
+            overlappingRemovedFiles.nonEmpty &&
+            !deleteReadRowMatches(overlappingRemovedFiles)) {
+          recordDeltaEvent(deltaLog,
+            opType = "delta.conflictDetection.dataSkipping.filesSkipped",
+            data = Map(
+              "arm" -> "deleteRead",
+              "candidateFiles" -> overlappingRemovedFiles.size,
+              "skippedFiles" -> overlappingRemovedFiles.size))
+          None
+        } else {
+          overlappingRemovedFiles.headOption
+        }
       if (deleteReadOverlap.nonEmpty) {
         val partitionOpt = getPrettyPartitionMessage(readFilePaths(deleteReadOverlap.get.path))
         throw DeltaErrors.concurrentDeleteReadException(

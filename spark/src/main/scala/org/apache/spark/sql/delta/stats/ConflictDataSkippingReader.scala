@@ -29,11 +29,11 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.functions.{col, from_json}
+import org.apache.spark.sql.functions.{coalesce, col, from_json, lit, sum}
 
 /**
- * Reader-side data skipping used during conflict detection (row-level concurrency Case 1: writers
- * touching disjoint data ranges).
+ * Reader-side data skipping used during conflict detection between writers that touch disjoint
+ * data ranges.
  *
  * Mixed into [[DataSkippingReaderBase]] as a self-typed trait so this feature is a single isolated
  * unit that only ADDS methods -- it does not modify any existing data-skipping code. It is opt-in:
@@ -235,7 +235,8 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
    * when no file in any partition matches. Deliberately an existence check rather than per-file
    * attribution: we never map a scanned row back to its [[AddFile]], so there is no
    * `_metadata.file_path` distinct/collect and no chance that a path-canonicalization mismatch
-   * drops a genuinely-matching file (which would be a missed conflict).
+   * drops a genuinely-matching file (which would be a missed conflict). Mirrors
+   * [[anyRemovedRowMatchesReadPredicate]].
    *
    * One-way safe: returns false (no conflict) only when the scan PROVES no candidate has a matching
    * row. It returns true whenever it cannot prove that -- an ineligible read, a scan skipped
@@ -297,6 +298,85 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
   }
 
   /**
+   * Delete/read conflict refinement: decides whether any row the winning
+   * transaction REMOVED from the given files matches the current transaction's read
+   * predicates. The caller ([[org.apache.spark.sql.delta.ConflictChecker]]) uses this to replace
+   * the path-keyed delete/read abort with a row-level one -- a concurrently-removed file the
+   * transaction read is a genuine conflict only when a removed row actually matches what it read.
+   *
+   * Rather than reading the removed rows directly (which would need an inverse deletion-vector
+   * scan), we exploit that a DML only ever ADDS deletions: the winner's post-image deletion vector
+   * is a superset of the pre-image one, so its post-image live rows are a SUBSET of the pre-image
+   * live rows, and the removed rows are exactly their difference. Hence, for the read condition
+   * `cond` (OR across reads, AND within a read), summed over the overlapping files:
+   *
+   *   matches(removed) = matches(pre-image live rows) - matches(post-image live rows)
+   *
+   * `preImageFiles` are the removed files viewed under their pre-image DV (one [[AddFile]] per
+   * `RemoveFile`); `postImageFiles` are the winner's paired re-added [[AddFile]]s under their
+   * post-image DV (absent for a full-file removal, whose removed set is the whole pre-image). Every
+   * per-file term is non-negative (subset), so the total difference is >= 1 iff some removed row
+   * matches. The two images are unioned with signed weights (+1 pre, -1 post) and summed in a
+   * SINGLE Spark job over the (few) overlapping files, with no per-file attribution and no giant
+   * row-index predicate.
+   *
+   * One-way safe: returns true (conflict) unless the scan PROVES no removed row matches. A read
+   * with no eligible (deterministic, subquery-free, non-metadata) filter matches everything, so it
+   * cannot prove non-match and returns true. Any failure falls back to true (path-keyed abort).
+   */
+  private[delta] def anyRemovedRowMatchesReadPredicate(
+      preImageFiles: Seq[AddFile],
+      postImageFiles: Seq[AddFile],
+      dataFiltersPerRead: Seq[Seq[Expression]]): Boolean = {
+    if (preImageFiles.isEmpty || dataFiltersPerRead.isEmpty || schema.isEmpty) return true
+    try {
+      // AND within a read over its eligible filters; a read with none matches everything, so we
+      // cannot prove any removed row fails it -> conservative conflict.
+      val perReadEligible = dataFiltersPerRead.map(eligibleSkippingFilters)
+      if (perReadEligible.exists(_.isEmpty)) return true
+      val snapshot = snapshotToScan
+      val sc = spark.sparkContext
+      val prevJobDesc = sc.getLocalProperty(SparkContext.SPARK_JOB_DESCRIPTION)
+      val removedMatchCount =
+        try {
+          sc.setJobDescription("Delta conflict detection: delete/read row-level skipping")
+          recordFrameProfile("Delta", "DataSkippingReader.anyRemovedRowMatchesReadPredicate") {
+            // Rows of `files` matching the read condition, tagged with `weight` so a single
+            // aggregation over the union yields the signed pre-minus-post difference. The condition
+            // is rebound to each freshly built DataFrame's columns (OR across reads, AND within).
+            def matchingRowWeights(files: Seq[AddFile], weight: Long): DataFrame = {
+              val df = snapshot.deltaLog.createDataFrame(
+                snapshot, files,
+                actionTypeOpt = Some(ConflictDataSkippingReader.DELETE_READ_ACTION_TYPE))
+              val condition = perReadEligible
+                .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
+                .reduce(_ || _)
+              df.where(condition).select(lit(weight).as("weight"))
+            }
+            // matches(removed) = matches(pre-image live) - matches(post-image live), evaluated in a
+            // SINGLE Spark job: union the per-image weighted matches (+1 pre, -1 post) and sum. A
+            // full-file removal has no post-image, so the pre-image count alone is the removed set.
+            val preWeights = matchingRowWeights(preImageFiles, 1L)
+            val weights =
+              if (postImageFiles.isEmpty) preWeights
+              else preWeights.union(matchingRowWeights(postImageFiles, -1L))
+            weights.select(coalesce(sum(col("weight")), lit(0L))).head().getLong(0)
+          }
+        } finally {
+          sc.setJobDescription(prevJobDesc)
+        }
+      removedMatchCount > 0
+    } catch {
+      case NonFatal(e) =>
+        // Optimization only: never let a scan failure abort or silently pass a commit. Fall back to
+        // the default (feature-off) behavior of treating the removed files as a conflict.
+        logWarning(log"Conflict-time delete/read row-level skipping failed to evaluate; falling " +
+          log"back to treating the removed files as a conflict", e)
+        true
+    }
+  }
+
+  /**
    * Rebinds `e`'s attribute references to `df`'s output columns BY NAME, so a read predicate
    * resolved against the transaction's plan can be evaluated on a freshly built DataFrame. Nested
    * struct accesses are resolved by their field NAMES too (via a back-tick-quoted dotted path), not
@@ -347,6 +427,7 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
 }
 
 object ConflictDataSkippingReader {
-  /** `TahoeFileIndex` action-type tag for the conflict-time value-exact scan (metrics only). */
+  /** `TahoeFileIndex` action-type tags for the conflict-time data-reading scans (metrics only). */
   private[delta] val VALUE_EXACT_ACTION_TYPE = "conflictDetectionValueExact"
+  private[delta] val DELETE_READ_ACTION_TYPE = "conflictDetectionDeleteRead"
 }
