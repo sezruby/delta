@@ -557,7 +557,18 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
           |narrowed) added files during commit. The scan runs synchronously on the committing thread
           |inside the conflict-retry loop and is bounded by
           |conflictDetection.dataSkipping.valueExact.maxBytes. One-way safe: a file is excluded only
-          |when an actual scan proves no row matches.""".stripMargin)
+          |when an actual scan proves no row matches.
+          |
+          |This flag additionally refines the delete/read check with the same read-the-data
+          |approach: a merge-on-read file the winner removed and re-added at the same path carries
+          |no new rows, so it is excluded from the added-files check, and the delete/read check
+          |aborts only when a row the winner actually removed matches the current transaction's read
+          |predicates. The removed rows are obtained without an inverse deletion-vector read:
+          |because the winner's new deletion vector is a superset of the pre-image one, the count of
+          |predicate-matching removed rows equals matches(pre-image live view) - matches(post-image
+          |live view), so two ordinary reads of the (few) overlapping files suffice. One-way safe:
+          |the loser aborts unless the removed rows are proven not to match; any error or missing
+          |information falls back to the path-keyed abort.""".stripMargin)
       .booleanConf
       .createWithDefault(false)
 
