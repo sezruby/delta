@@ -37,3 +37,23 @@ case class AlterTableClusterBy(
 
 /** A TableChange to alter clustering columns for a table. */
 case class ClusterBy(clusteringColumns: Seq[NamedReference]) extends TableChange {}
+
+/**
+ * The logical plan of the following commands:
+ *  - ALTER TABLE ... REPLACE PARTITIONED BY WITH CLUSTER BY (col1, col2, ...)
+ *  - ALTER TABLE ... REPLACE PARTITIONED BY WITH CLUSTER BY NONE
+ *
+ * Converts a partitioned table into a clustered table (or an unpartitioned, unclustered table
+ * with NONE) without rewriting data files.
+ */
+case class AlterTableReplacePartitionedByWithClusterBy(
+    table: LogicalPlan, clusterBySpec: Option[ClusterBySpec]) extends AlterTableCommand {
+  override def changes: Seq[TableChange] =
+    Seq(ReplacePartitionedByWithClusterBy(clusterBySpec.map(_.columnNames).getOrElse(Seq.empty)))
+
+  protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = copy(table = newChild)
+}
+
+/** A TableChange to replace the partitioning of a table with the given clustering columns. */
+case class ReplacePartitionedByWithClusterBy(clusteringColumns: Seq[NamedReference])
+  extends TableChange {}
