@@ -284,6 +284,18 @@ class ReplacePartitionedByWithClusterBySuite
       assert(materialized.subsetOf(afterPaths))
       assert((afterPaths intersect notMaterialized).isEmpty)
       assert(filesWithoutPartitionColumns(path, "p").isEmpty)
+      // Synthesized stats for kept files, collected stats for rewritten files.
+      afterFiles.foreach { f =>
+        assert(statsOf(f)("nullCount").asInstanceOf[Map[String, Any]].contains("p"))
+      }
+      val rewrittenStats = afterFiles.filterNot(f => materialized.contains(f.path)).map(statsOf)
+      assert(rewrittenStats.nonEmpty)
+      def pStat(kind: String): Seq[String] =
+        rewrittenStats.map(_(kind).asInstanceOf[Map[String, Any]]("p").toString).toSeq
+      assert(pStat("minValues").min === "a")
+      assert(pStat("maxValues").max === "b")
+      assert(filesRead(spark, deltaLog, "p = 'b'", checkEmptyUnusedFilters = false) <
+        afterFiles.length)
 
       val changes = deltaLog.getChanges(after.version).next()._2
       val removed = changes.collect { case r: RemoveFile => r }
