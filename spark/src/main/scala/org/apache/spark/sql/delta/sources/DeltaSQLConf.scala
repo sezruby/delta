@@ -3445,6 +3445,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       )
     .createWithDefault(4)
 
+  val DELTA_REPLACE_PARTITIONED_BY_VERIFY_MATERIALIZED_PARTITION_COLUMNS =
+    buildConf("alterTable.replacePartitionedBy.verifyMaterializedPartitionColumns")
+      .internal()
+      .doc("""When true, ALTER TABLE ... REPLACE PARTITIONED BY WITH CLUSTER BY reads the Parquet
+        |footer of every data file to verify that the partition columns are physically stored in
+        |the file before dropping the partitioning. Disabling this check can make partition column
+        |values unreadable if a data file does not contain them.""".stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_LOG_CACHE_SIZE = buildConf("delta.log.cacheSize")
     .internal()
     .doc("The maximum number of DeltaLog instances to cache in memory.")
