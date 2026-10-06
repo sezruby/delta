@@ -4144,6 +4144,13 @@ trait DeltaErrorsBase
     )
   }
 
+  def invalidCompactionBinningColumn(column: String, reason: String): Throwable = {
+    new DeltaAnalysisException(
+      errorClass = "DELTA_INVALID_COMPACTION_BINNING_COLUMN",
+      messageParameters = Array(column, DeltaConfigs.COMPACTION_BINNING_COLUMNS.key, reason)
+    )
+  }
+
   def clusteringColumnUnsupportedDataTypes(clusteringColumnsWithDataTypes: String): Throwable = {
     new DeltaAnalysisException(
       errorClass = "DELTA_CLUSTERING_COLUMNS_DATATYPE_NOT_SUPPORTED",

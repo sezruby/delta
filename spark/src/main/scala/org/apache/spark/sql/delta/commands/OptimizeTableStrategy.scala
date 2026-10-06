@@ -16,12 +16,15 @@
 
 package org.apache.spark.sql.delta.commands
 
+import scala.util.control.NonFatal
+
 import org.apache.spark.sql.delta.skipping.clustering.{ClusteredTableUtils, ClusteringColumnInfo, ClusteringStatsCollector}
 import org.apache.spark.sql.delta.skipping.clustering.ZCube
 import org.apache.spark.sql.delta.{DeltaConfigs, DeltaErrors, OptimisticTransaction, Snapshot}
 import org.apache.spark.sql.delta.actions.{AddFile, DeletionVectorDescriptor, FileAction, RemoveFile}
 import org.apache.spark.sql.delta.commands.OptimizeTableStrategy.DummyBinInfo
-import org.apache.spark.sql.delta.commands.optimize.{AddFileWithNumRecords, DeletionVectorStats, OptimizeStats, ZOrderFileStats, ZOrderStats}
+import org.apache.spark.sql.delta.commands.optimize.{AddFileWithNumRecords, DeletionVectorStats, OptimizeStats, StatsBasedFileOrdering, ZOrderFileStats, ZOrderStats}
+import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.sources.DeltaSQLConf.{DELTA_OPTIMIZE_CLUSTERING_MIN_CUBE_SIZE, DELTA_OPTIMIZE_CLUSTERING_TARGET_CUBE_SIZE}
 import org.apache.spark.sql.delta.zorder.ZCubeInfo
@@ -54,6 +57,12 @@ trait OptimizeTableStrategy {
    * @return Prepared files for the subsequent optimization.
    */
   def prepareFilesPerPartition(inputFiles: Seq[AddFile]): Seq[AddFile] = inputFiles.sortBy(_.size)
+
+  /**
+   * Called once with all files selected for optimization, before they are grouped into bins
+   * with [[prepareFilesPerPartition]].
+   */
+  def prepareFiles(files: Seq[AddFile]): Unit = {}
 
   /** The optimize mode the strategy instance is created for. */
   def optimizeTableMode: OptimizeTableMode.Value
@@ -93,7 +102,7 @@ trait OptimizeTableStrategy {
       bins: Seq[Bin]): Unit
 }
 
-object OptimizeTableStrategy {
+object OptimizeTableStrategy extends DeltaLogging {
   // A trait representing the context for a Bin.
   sealed trait BinInfo
 
@@ -107,7 +116,8 @@ object OptimizeTableStrategy {
       sparkSession: SparkSession,
       snapshot: Snapshot,
       optimizeContext: DeltaOptimizeContext,
-      zOrderBy: Seq[String]): OptimizeTableStrategy = getMode(snapshot, zOrderBy) match {
+      zOrderBy: Seq[String],
+      isAutoCompact: Boolean = false): OptimizeTableStrategy = getMode(snapshot, zOrderBy) match {
     case OptimizeTableMode.CLUSTERING =>
       ClusteringStrategy(
         sparkSession,
@@ -115,8 +125,25 @@ object OptimizeTableStrategy {
         optimizeContext)
     case OptimizeTableMode.ZORDER => ZOrderStrategy(sparkSession, zOrderBy)
     case OptimizeTableMode.COMPACTION =>
-      CompactionStrategy(sparkSession, optimizeContext)
+      CompactionStrategy(
+        sparkSession,
+        optimizeContext,
+        compactionFileOrdering(sparkSession, snapshot, isAutoCompact))
     case other => throw new UnsupportedOperationException(s"Unsupported mode $other")
+  }
+
+  private def compactionFileOrdering(
+      sparkSession: SparkSession,
+      snapshot: Snapshot,
+      isAutoCompact: Boolean): Option[StatsBasedFileOrdering] = {
+    try {
+      StatsBasedFileOrdering.fromSnapshot(sparkSession, snapshot)
+    } catch {
+      // Do not fail the write that triggered auto compaction because of an invalid setting.
+      case NonFatal(e) if isAutoCompact =>
+        logWarning(log"Ignoring the invalid compaction binning columns in auto compaction", e)
+        None
+    }
   }
 
   private def getMode(snapshot: Snapshot, zOrderBy: Seq[String]): OptimizeTableMode.Value = {
@@ -134,10 +161,16 @@ object OptimizeTableStrategy {
   }
 }
 
-/** Implements compaction strategy */
+/**
+ * Implements compaction strategy.
+ *
+ * @param fileOrdering If set, candidate files are ordered by the min/max statistics of the
+ *                     table's compaction binning columns instead of by size.
+ */
 case class CompactionStrategy(
     override val sparkSession: SparkSession,
-    optimizeContext: DeltaOptimizeContext) extends OptimizeTableStrategy {
+    optimizeContext: DeltaOptimizeContext,
+    fileOrdering: Option[StatsBasedFileOrdering] = None) extends OptimizeTableStrategy {
 
   override val optimizeTableMode: OptimizeTableMode.Value = OptimizeTableMode.COMPACTION
 
@@ -149,6 +182,15 @@ case class CompactionStrategy(
 
   override def curve: String = {
     throw new UnsupportedOperationException("Compaction doesn't support clustering.")
+  }
+
+  override def prepareFiles(files: Seq[AddFile]): Unit = fileOrdering.foreach(_.loadSortKeys(files))
+
+  override def prepareFilesPerPartition(inputFiles: Seq[AddFile]): Seq[AddFile] = {
+    fileOrdering match {
+      case Some(ordering) => ordering.sort(inputFiles)
+      case None => super.prepareFilesPerPartition(inputFiles)
+    }
   }
 
   override def updateOptimizeStats(

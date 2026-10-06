@@ -76,6 +76,16 @@ For Scala, Java, and Python API syntax details, see the [Delta Lake APIs](/delta
   compacting many small files.
 </Aside>
 
+#### Group files by column statistics
+
+By default, compaction groups files of similar size into the same output file, so an output file can mix rows from across the whole value range of a column. To keep file-level [data skipping](#data-skipping) effective after compaction, set the table property `delta.compaction.binningColumns` to a comma-separated list of columns. Compaction then orders its candidate files by the per-file minimum and maximum values of these columns, in the order listed, before grouping them, so each output file covers a narrow range of values. For example, on a table that is written to in daily batches:
+
+```sql
+ALTER TABLE delta_table_name SET TBLPROPERTIES ('delta.compaction.binningColumns' = 'eventDate')
+```
+
+The setting applies to `OPTIMIZE` without `ZORDER BY` on tables without liquid clustering, and to auto compaction. Rows are not reordered within a file. The columns must have statistics (see [Data skipping](#data-skipping)) and cannot be partition columns. Files without statistics for these columns are grouped last.
+
 Readers of Delta tables use snapshot isolation, which means that they are not interrupted when `OPTIMIZE` removes unnecessary files from the transaction log. `OPTIMIZE` makes no data related changes to the table, so a read before and after an `OPTIMIZE` has the same results. Performing `OPTIMIZE` on a table that is a streaming source does not affect any current or future streams that treat this table as a source. `OPTIMIZE` returns the file statistics (min, max, total, and so on) for the files removed and the files added by the operation. Optimize stats also contains the number of batches, and partitions optimized.
 
 ## Auto compaction

@@ -277,7 +277,7 @@ class OptimizeExecutor(
    * 3. Clustering
    */
   private val optimizeStrategy =
-    OptimizeTableStrategy(sparkSession, snapshot, optimizeContext, zOrderByColumns)
+    OptimizeTableStrategy(sparkSession, snapshot, optimizeContext, zOrderByColumns, isAutoCompact)
 
   /** Timestamp to use in [[FileAction]] */
   private val operationTimestamp = new SystemClock().getTimeMillis()
@@ -329,6 +329,7 @@ class OptimizeExecutor(
         .map { case (_, files) => (files.head.partitionValues, files) }
         .toSeq
 
+      optimizeStrategy.prepareFiles(filesToProcess)
       val jobs = groupFilesIntoBins(partitionsToCompact)
 
       val batchResults = batchSize match {

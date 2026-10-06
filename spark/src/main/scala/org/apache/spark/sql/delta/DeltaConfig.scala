@@ -705,6 +705,25 @@ trait DeltaConfigsBase extends DeltaLogging {
       |""".stripMargin)
 
   /**
+   * Columns whose min/max statistics are used to group files into bins when compacting the
+   * table (OPTIMIZE without ZORDER BY on a non-clustered table, and auto compaction).
+   */
+  val COMPACTION_BINNING_COLUMNS = buildConfig[Option[String]](
+    "compaction.binningColumns",
+    null,
+    v => Option(v),
+    vOpt => vOpt.forall(v => DeltaSqlParserUtils.parseMultipartColumnList(v).isDefined),
+    """
+      |The compaction.binningColumns parameter is a comma-separated list of column identifiers.
+      |Escape special characters with backticks (`).
+      |
+      |When set, compaction orders its candidate files by the per-file min/max statistics of these
+      |columns, in the order listed, instead of by file size, before packing them into bins. Files
+      |with similar values end up in the same output file, which keeps file-level data skipping
+      |effective on these columns. Rows are not reordered. The columns must have statistics.
+      |""".stripMargin)
+
+  /**
    * For string columns, how long prefix to store in the data skipping index.
    * Note that the behavior from table property overrides the config:
    * [[DeltaSQLConf.DATA_SKIPPING_STRING_PREFIX_LENGTH]]

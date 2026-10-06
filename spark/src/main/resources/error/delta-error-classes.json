@@ -1921,6 +1921,12 @@
     ],
     "sqlState" : "XXKDS"
   },
+  "DELTA_INVALID_COMPACTION_BINNING_COLUMN" : {
+    "message" : [
+      "Column '<column>' in '<config>' cannot be used to group files for compaction: <reason>."
+    ],
+    "sqlState" : "22000"
+  },
   "DELTA_INVALID_CONSTRAINT_NAME" : {
     "message" : [
       "Cannot use <name> as the name of a CHECK constraint. This name is reserved."
