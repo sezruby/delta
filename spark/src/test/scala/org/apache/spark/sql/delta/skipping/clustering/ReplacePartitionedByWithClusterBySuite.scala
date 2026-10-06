@@ -19,7 +19,7 @@ package org.apache.spark.sql.delta.skipping.clustering
 import org.apache.spark.sql.delta.skipping.ClusteredTableTestUtils
 import org.apache.spark.sql.delta.skipping.clustering.temp.{AlterTableReplacePartitionedByWithClusterBy, ClusterBySpec}
 import org.apache.spark.sql.delta.{DeltaAnalysisException, DeltaLog}
-import org.apache.spark.sql.delta.actions.AddFile
+import org.apache.spark.sql.delta.actions.{AddFile, RemoveFile}
 import org.apache.spark.sql.delta.commands.ReplacePartitionedByUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.stats.DataSkippingDeltaTestsUtils
@@ -92,6 +92,8 @@ class ReplacePartitionedByWithClusterBySuite
 
       val changes = deltaLog.getChanges(after.version).next()._2
       assert(changes.collect { case a: AddFile => a }.forall(!_.dataChange))
+      assert(!changes.exists(_.isInstanceOf[RemoveFile]))
+      assert(lastCommit.operationMetrics.flatMap(_.get("numRewrittenFiles")) === Some("0"))
 
       // Time travel to the partitioned version still works.
       checkAnswer(
@@ -245,7 +247,89 @@ class ReplacePartitionedByWithClusterBySuite
     }
   }
 
-  test("fails when data files do not store the partition columns") {
+  private def filesWithoutPartitionColumns(path: String, partitionColumns: String*) = {
+    val deltaLog = DeltaLog.forTable(spark, path)
+    ReplacePartitionedByUtils.findFilesWithoutPartitionColumns(
+      spark, deltaLog, deltaLog.update(), partitionColumns)
+  }
+
+  private def lastOperationMetrics(path: String): Map[String, String] =
+    sql(s"DESCRIBE HISTORY delta.`$path` LIMIT 1")
+      .select("operationMetrics").head().getMap[String, String](0).toMap
+
+  test("rewrites the data files that do not store the partition columns") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"""CREATE TABLE delta.`$path` (id BIGINT, p STRING) USING delta PARTITIONED BY (p)
+             |TBLPROPERTIES ('delta.writePartitionColumnsToParquet' = 'false')""".stripMargin)
+      sql(s"INSERT INTO delta.`$path` VALUES (1, 'a'), (2, 'b')")
+      sql(s"ALTER TABLE delta.`$path` SET TBLPROPERTIES " +
+        "('delta.writePartitionColumnsToParquet' = 'true')")
+      sql(s"INSERT INTO delta.`$path` VALUES (3, 'a'), (4, null)")
+      val deltaLog = DeltaLog.forTable(spark, path)
+      val before = deltaLog.update()
+      val notMaterialized = filesWithoutPartitionColumns(path, "p").map(_.path).toSet
+      assert(notMaterialized.size === 2)
+      val materialized = before.allFiles.collect().map(_.path).toSet -- notMaterialized
+      assert(materialized.size === 2)
+
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+
+      val after = deltaLog.update()
+      assert(after.version === before.version + 1)
+      assert(after.metadata.partitionColumns.isEmpty)
+      val afterFiles = after.allFiles.collect()
+      assert(afterFiles.forall(_.partitionValues.isEmpty))
+      val afterPaths = afterFiles.map(_.path).toSet
+      assert(materialized.subsetOf(afterPaths))
+      assert((afterPaths intersect notMaterialized).isEmpty)
+      assert(filesWithoutPartitionColumns(path, "p").isEmpty)
+
+      val changes = deltaLog.getChanges(after.version).next()._2
+      val removed = changes.collect { case r: RemoveFile => r }
+      assert(removed.map(_.path).toSet === notMaterialized)
+      assert(removed.forall(!_.dataChange))
+      assert(changes.collect { case a: AddFile => a }.forall(!_.dataChange))
+      val metrics = lastOperationMetrics(path)
+      assert(metrics("numRewrittenFiles") === "2")
+      assert(metrics("numAddedFilesFromRewrite").toInt > 0)
+
+      checkAnswer(readTable(path),
+        Seq(Row(1L, "a"), Row(2L, "b"), Row(3L, "a"), Row(4L, null)))
+      checkAnswer(readTable(path).where("p = 'b'").select("id"), Row(2L))
+      checkAnswer(readTable(path).where("p IS NULL").select("id"), Row(4L))
+    }
+  }
+
+  test("rewrite applies deletion vectors and preserves row tracking") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"""CREATE TABLE delta.`$path` (id BIGINT, p STRING) USING delta PARTITIONED BY (p)
+             |TBLPROPERTIES (
+             |  'delta.writePartitionColumnsToParquet' = 'false',
+             |  'delta.enableDeletionVectors' = 'true',
+             |  'delta.enableRowTracking' = 'true')""".stripMargin)
+      spark.range(0, 100, 1, 4).selectExpr("id", "cast(id % 3 as string) as p")
+        .write.format("delta").mode("append").save(path)
+      sql(s"DELETE FROM delta.`$path` WHERE id % 10 = 0")
+      val deltaLog = DeltaLog.forTable(spark, path)
+      assert(deltaLog.update().allFiles.collect().exists(_.deletionVector != null))
+      val rowTrackingColumns =
+        Seq("*", "_metadata.row_id", "_metadata.row_commit_version")
+      val expected = readTable(path).selectExpr(rowTrackingColumns: _*).collect()
+      assert(expected.length === 90)
+
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+
+      val after = deltaLog.update()
+      assert(after.metadata.partitionColumns.isEmpty)
+      assert(after.allFiles.collect().forall(_.deletionVector == null))
+      assert(filesWithoutPartitionColumns(path, "p").isEmpty)
+      checkAnswer(readTable(path).selectExpr(rowTrackingColumns: _*), expected)
+    }
+  }
+
+  test("fails when data files do not store the partition columns and rewrite is disabled") {
     withTempDir { dir =>
       val path = dir.getCanonicalPath
       sql(s"""CREATE TABLE delta.`$path` (id BIGINT, p STRING) USING delta PARTITIONED BY (p)
@@ -253,12 +337,17 @@ class ReplacePartitionedByWithClusterBySuite
       sql(s"INSERT INTO delta.`$path` VALUES (1, 'a'), (2, 'b')")
       val deltaLog = DeltaLog.forTable(spark, path)
       val versionBefore = deltaLog.update().version
-      val e = intercept[DeltaAnalysisException] {
-        sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+      val e = withSQLConf(DeltaSQLConf
+          .DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES.key -> "false") {
+        intercept[DeltaAnalysisException] {
+          sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+        }
       }
       assert(e.getErrorClass ===
         "DELTA_REPLACE_PARTITIONED_BY_PARTITION_COLUMNS_NOT_MATERIALIZED")
       assert(e.getMessage.contains("2 data file(s)"))
+      assert(e.getMessage.contains(
+        DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES.key))
       assert(deltaLog.update().version === versionBefore)
       assert(deltaLog.update().metadata.partitionColumns === Seq("p"))
     }
