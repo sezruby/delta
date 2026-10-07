@@ -84,9 +84,13 @@ trait ClassicMergeExecutor extends MergeOutputGeneration {
     spark.sparkContext.register(touchedFilesAccum, TOUCHED_FILES_ACCUM_NAME)
 
     // Prune non-matching files if we don't need to collect them for NOT MATCHED BY SOURCE clauses.
+    // The optional source-key predicates also record which target keys this MERGE reads, so that
+    // conflict detection can tell MERGEs on disjoint keys apart.
     val dataSkippedFiles =
       if (notMatchedBySourceClauses.isEmpty) {
-        deltaTxn.filterFiles(getTargetOnlyPredicates(spark), keepNumRecords = true)
+        deltaTxn.filterFiles(
+          getTargetOnlyPredicates(spark) ++ getSourceKeyReadPredicates(spark),
+          keepNumRecords = true)
       } else {
         deltaTxn.filterFiles(filters = Seq(Literal.TrueLiteral), keepNumRecords = true)
       }

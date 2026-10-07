@@ -586,6 +586,39 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .longConf
       .createWithDefault(1L << 30) // 1 GiB
 
+  val MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED =
+    buildConf("merge.sourceKeyReadPredicate.enabled")
+      .internal()
+      .doc(
+        """When enabled, a MERGE without NOT MATCHED BY SOURCE clauses records, as its read
+          |predicate, the target rows whose `target_expr = source_expr` equi-join keys (from the ON
+          |condition) equal the keys of some source row. Without it, a key-only ON condition such as
+          |`t.id = s.id` records a read predicate of `true`, so any concurrently added file
+          |conflicts with the MERGE. The predicate is a cheap pre-filter on the source keys (see
+          |merge.sourceKeyReadPredicate.inSetThreshold), which also prunes the MERGE's own target
+          |scan, plus an exact match that the value-exact conflict checks
+          |(conflictDetection.dataSkipping.valueExact.enabled) evaluate as a semi-join against the
+          |MERGE source, like Databricks Runtime. Concurrent MERGEs on disjoint keys then commit,
+          |while a concurrent change to any of this MERGE's keys (an update, or an insert of the
+          |same new key) still conflicts. There is no limit on the number of source keys.
+          |""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
+  val MERGE_SOURCE_KEY_READ_PREDICATE_IN_SET_THRESHOLD =
+    buildConf("merge.sourceKeyReadPredicate.inSetThreshold")
+      .internal()
+      .doc(
+        """The maximum number of distinct source key tuples for which
+          |merge.sourceKeyReadPredicate.enabled builds a `target_expr IN (source values)`
+          |pre-filter (the values are collected to the driver). Above it, the pre-filter is a
+          |`target_expr BETWEEN min AND max` range of the source values. This only affects pruning:
+          |the exact source-key match still decides the conflict, so a smaller value never causes
+          |a conflict the value-exact check would not. A non-positive value always uses the
+          |range.""".stripMargin)
+      .intConf
+      .createWithDefault(10000)
+
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")
       .doc("The default writer protocol version to create new tables with, unless a feature " +

@@ -21,7 +21,7 @@ import scala.util.control.NonFatal
 import org.apache.spark.sql.delta.ClassicColumnConversions._
 import org.apache.spark.sql.delta.DeltaTableUtils
 import org.apache.spark.sql.delta.actions.AddFile
-import org.apache.spark.sql.delta.expressions.DecodeNestedZ85EncodedVariant
+import org.apache.spark.sql.delta.expressions.{DecodeNestedZ85EncodedVariant, MergeSourceKeyMatch}
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -270,11 +270,6 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
       // winner's files and this schema agree by the time we get here.
       val df = snapshot.deltaLog.createDataFrame(
         snapshot, files, actionTypeOpt = Some(ConflictDataSkippingReader.VALUE_EXACT_ACTION_TYPE))
-      // Rebind each filter's attributes to the fresh DataFrame's columns by name, AND within a
-      // read, OR across reads -- a file matches if any read's predicate matches any of its rows.
-      val condition = perReadEligible
-        .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
-        .reduce(_ || _)
       // The caller only needs a boolean (see the scaladoc), so run one short-circuiting existence
       // check instead of attributing rows back to files.
       val sc = spark.sparkContext
@@ -282,7 +277,7 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
       try {
         sc.setJobDescription("Delta conflict detection: value-exact data skipping")
         recordFrameProfile("Delta", "DataSkippingReader.anyAddedRowMatchesReadPredicate") {
-          !df.where(condition).isEmpty
+          !rowsMatchingAnyRead(df, perReadEligible).isEmpty
         }
       } finally {
         sc.setJobDescription(prevJobDesc)
@@ -348,10 +343,7 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
               val df = snapshot.deltaLog.createDataFrame(
                 snapshot, files,
                 actionTypeOpt = Some(ConflictDataSkippingReader.DELETE_READ_ACTION_TYPE))
-              val condition = perReadEligible
-                .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
-                .reduce(_ || _)
-              df.where(condition).select(lit(weight).as("weight"))
+              rowsMatchingAnyRead(df, perReadEligible).select(lit(weight).as("weight"))
             }
             // matches(removed) = matches(pre-image live) - matches(post-image live), evaluated in a
             // SINGLE Spark job: union the per-image weighted matches (+1 pre, -1 post) and sum. A
@@ -373,6 +365,46 @@ trait ConflictDataSkippingReader extends DeltaLogging { self: DataSkippingReader
         logWarning(log"Conflict-time delete/read row-level skipping failed to evaluate; falling " +
           log"back to treating the removed files as a conflict", e)
         true
+    }
+  }
+
+  /**
+   * The rows of `df` matching ANY read: AND within a read, OR across reads, with every filter
+   * rebound to `df`'s columns. A [[MergeSourceKeyMatch]] is evaluated exactly, as a left-semi join
+   * of the read's (already filtered) rows against its source keys on the key tuple -- the same join
+   * DBR uses for a MERGE source read predicate -- so a MERGE's read covers just the keys of its
+   * source, however many there are. Without one, this is a single `where`.
+   *
+   * With a join, the reads are unioned, so a row matching several reads appears once per read.
+   * That multiplicity depends only on the row's values, so existence checks and the delete/read
+   * pre-minus-post count (where each live post-image row is also a pre-image row) stay exact.
+   */
+  private def rowsMatchingAnyRead(
+      df: DataFrame,
+      perReadEligible: Seq[Seq[Expression]]): DataFrame = {
+    def isKeyMatch(e: Expression): Boolean = e.isInstanceOf[MergeSourceKeyMatch]
+    def where(rows: DataFrame, filters: Seq[Expression]): DataFrame =
+      filters.map(f => rebindToDataFrame(f, df)).reduceOption(_ && _)
+        .map(condition => rows.where(condition))
+        .getOrElse(rows)
+    if (!perReadEligible.exists(_.exists(isKeyMatch))) {
+      df.where(perReadEligible
+        .map(filters => filters.map(f => rebindToDataFrame(f, df)).reduce(_ && _))
+        .reduce(_ || _))
+    } else {
+      perReadEligible.map { filters =>
+        val (keyMatches, plainFilters) = filters.partition(isKeyMatch)
+        keyMatches.foldLeft(where(df, plainFilters)) {
+          case (rows, m: MergeSourceKeyMatch) =>
+            val source = m.sourceKeys
+            val joinCondition = m.targetKeys.zip(source.columns).map {
+              case (targetKey, sourceKey) =>
+                rebindToDataFrame(targetKey, df) === source.col(quoteColumnName(sourceKey))
+            }.reduce(_ && _)
+            rows.join(source, joinCondition, "left_semi")
+          case (rows, _) => rows
+        }
+      }.reduce(_ union _)
     }
   }
 
