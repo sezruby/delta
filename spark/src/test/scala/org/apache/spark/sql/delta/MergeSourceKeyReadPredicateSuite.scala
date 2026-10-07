@@ -32,10 +32,11 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.ThreadUtils
 
 /**
- * Tests for [[DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED]]: a MERGE records
- * `target_key IN (source keys)` as a read predicate so that conflict-time data skipping can
- * reconcile concurrent MERGEs on disjoint keys, while concurrent changes to the same key (an
- * update of the same row, or an insert of the same new key) still conflict.
+ * Tests for [[DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED]]: a MERGE records the target
+ * rows whose key matches a source key as its read predicate (a pre-filter plus an exact semi-join
+ * against the MERGE source, like DBR) so that conflict-time data skipping can reconcile concurrent
+ * MERGEs on disjoint keys, however many keys there are, while concurrent changes to the same key
+ * (an update of the same row, or an insert of the same new key) still conflict.
  *
  * Each race runs the loser MERGE up to pre-commit, commits the winner MERGE, then lets the loser
  * commit. The table has two files, ids [0, 50) and [50, 100), so that two MERGEs that update
@@ -79,11 +80,13 @@ class MergeSourceKeyReadPredicateSuite extends QueryTest
        |WHEN NOT MATCHED THEN INSERT *""".stripMargin
   }
 
-  private def allConfs(enabled: Boolean, maxKeys: Int = 100000): Seq[(String, String)] = Seq(
+  private def allConfs(
+      enabled: Boolean,
+      inSetThreshold: Int = 10000): Seq[(String, String)] = Seq(
     DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_ENABLED.key -> "true",
     DeltaSQLConf.DELTA_CONFLICT_DETECTION_DATA_SKIPPING_VALUE_EXACT_ENABLED.key -> "true",
     DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED.key -> enabled.toString,
-    DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_MAX_KEYS.key -> maxKeys.toString)
+    DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_IN_SET_THRESHOLD.key -> inSetThreshold.toString)
 
   /**
    * Runs `loserSql` up to pre-commit, commits `winnerSql`, then lets the loser commit. Returns
@@ -166,13 +169,61 @@ class MergeSourceKeyReadPredicateSuite extends QueryTest
     }
   }
 
-  test("more distinct source keys than maxKeys: falls back to the existing read predicate") {
+  test("more source keys than inSetThreshold: range pre-filter, the exact key match decides") {
     withTempDir { dir =>
       createTable(dir, deletionVectors = true)
-      withSQLConf(allConfs(enabled = true, maxKeys = 1): _*) {
-        assert(race(upsert(dir, Seq(60L, 500L), 2), upsert(dir, Seq(10L, 1000L), 1)) ==
-          "ConcurrentAppendException")
+      // 20000 even keys in [1000, 40998]: above the default threshold, so the pre-filter is the
+      // range [1000, 40998], which every winner key below falls into.
+      val loser =
+        s"""MERGE INTO ${tableRef(dir)} t
+           |USING (SELECT 1000 + 2 * id AS id, 2 AS v FROM range(20000)) s
+           |ON t.id = s.id
+           |WHEN MATCHED THEN UPDATE SET v = s.v
+           |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+      withSQLConf(allConfs(enabled = true): _*) {
+        val events = sourceKeyEvents {
+          assert(race(loser, upsert(dir, Seq(10L, 1001L), 1)) == COMMITTED)
+        }
+        assert(events.exists(_("preFilter") == "range"))
+        // Control: the winner updates one of the loser's 20000 keys.
+        assert(race(loser.replace("2 AS v", "3 AS v"), upsert(dir, Seq(1002L), 1)) != COMMITTED)
       }
+      val all = ids(dir)
+      assert(all.size == 100 + 20000 + 1 && all.distinct.size == all.size)
+    }
+  }
+
+  test("tiny inSetThreshold only changes the pre-filter: disjoint keys still commit") {
+    withTempDir { dir =>
+      createTable(dir, deletionVectors = true)
+      for (threshold <- Seq(1, 0)) {
+        withSQLConf(allConfs(enabled = true, inSetThreshold = threshold): _*) {
+          // The winner's new key 300 is inside the loser's key range [60, 500 + threshold].
+          val loserKeys = Seq(60L, 500L + threshold)
+          assert(race(upsert(dir, loserKeys, 2), upsert(dir, Seq(10L, 300L + threshold), 1)) ==
+            COMMITTED)
+        }
+      }
+      assert(ids(dir).size == 100 + 4)
+    }
+  }
+
+  test("multi-column key: tuples are matched exactly, not per column") {
+    withTempDir { dir =>
+      createTable(dir, deletionVectors = true)
+      // The loser reads (id, v) in {(60, 0), (61, 5)}. The winner's (60, 5) passes the per-column
+      // pre-filters (id IN (60, 61), v IN (0, 5)) but is not one of the loser's key tuples.
+      val loser =
+        s"""MERGE INTO ${tableRef(dir)} t
+           |USING (SELECT * FROM VALUES (60L, 0, 7), (61L, 5, 7) AS s(id, v, nv)) s
+           |ON t.id = s.id AND t.v = s.v
+           |WHEN MATCHED THEN UPDATE SET v = s.nv
+           |WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)""".stripMargin
+      withSQLConf(allConfs(enabled = true): _*) {
+        assert(race(loser, s"INSERT INTO ${tableRef(dir)} VALUES (60, 5)") == COMMITTED)
+      }
+      checkAnswer(sql(s"SELECT id, v FROM ${tableRef(dir)} WHERE id IN (60, 61)"),
+        Seq(Row(60L, 7), Row(60L, 5), Row(61L, 0), Row(61L, 5)))
     }
   }
 
@@ -214,25 +265,26 @@ class MergeSourceKeyReadPredicateSuite extends QueryTest
       .filter(_.tags.get("opType").contains("delta.dml.merge.sourceKeyReadPredicate"))
       .map(e => JsonUtils.fromJson[Map[String, Any]](e.blob))
 
-  test("event: applied within maxKeys, not applied above, nulls ignored, keys de-duplicated") {
+  test("event: IN pre-filter within inSetThreshold, range above, keys de-duplicated") {
     withTempDir { dir =>
       createTable(dir, deletionVectors = true)
-      withSQLConf(allConfs(enabled = true, maxKeys = 2): _*) {
+      withSQLConf(allConfs(enabled = true, inSetThreshold = 2): _*) {
         // Duplicate source keys (existing target rows, so insert-only MERGE is a no-op).
         val within = sourceKeyEvents(sql(insertOnly(dir, Seq(1L, 2L, 2L), 5)))
         assert(within.size == 1)
-        assert(within.head("applied") == true && within.head("numDistinctKeys") == 2)
+        assert(within.head("preFilter") == "inSet" && within.head("numDistinctKeys") == 2)
 
         val above = sourceKeyEvents(sql(upsert(dir, Seq(1L, 2L, 3L), 6)))
         assert(above.size == 1)
-        assert(above.head("applied") == false && above.head("numDistinctKeys") == 3)
+        assert(above.head("preFilter") == "range" && above.head("numDistinctKeys") == -1)
 
+        // A NULL key matches no target row: the MERGE reads nothing and updates nothing.
         val nullOnly = sourceKeyEvents(sql(
           s"""MERGE INTO ${tableRef(dir)} t
              |USING (SELECT CAST(NULL AS BIGINT) AS id, 7 AS v) s
              |ON t.id = s.id
              |WHEN MATCHED THEN UPDATE SET v = s.v""".stripMargin))
-        assert(nullOnly.size == 1 && nullOnly.head("applied") == false)
+        assert(nullOnly.size == 1)
       }
       checkAnswer(sql(s"SELECT id, v FROM ${tableRef(dir)} WHERE id IN (1, 2, 3)"),
         Seq(Row(1L, 6), Row(2L, 6), Row(3L, 6)))
@@ -254,7 +306,7 @@ class MergeSourceKeyReadPredicateSuite extends QueryTest
     }
   }
 
-  test("multi-column key: per-column IN predicates, MERGE result unchanged") {
+  test("event: multi-column key, MERGE result unchanged") {
     withTempDir { dir =>
       createTable(dir, deletionVectors = true)
       withSQLConf(allConfs(enabled = true): _*) {
@@ -264,7 +316,7 @@ class MergeSourceKeyReadPredicateSuite extends QueryTest
              |ON t.id = s.id AND t.v = s.v
              |WHEN MATCHED THEN UPDATE SET v = s.nv""".stripMargin))
         assert(events.size == 1)
-        assert(events.head("applied") == true && events.head("numKeyColumns") == 2)
+        assert(events.head("preFilter") == "inSet" && events.head("numKeyColumns") == 2)
       }
       checkAnswer(sql(s"SELECT id, v FROM ${tableRef(dir)} WHERE id IN (60, 61, 62)"),
         Seq(Row(60L, 3), Row(61L, 3), Row(62L, 0)))

@@ -590,33 +590,34 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
     buildConf("merge.sourceKeyReadPredicate.enabled")
       .internal()
       .doc(
-        """When enabled, MERGE (without NOT MATCHED BY SOURCE clauses) collects the distinct
-          |values of the source side of each `target_expr = source_expr` equi-join conjunct of the
-          |ON condition and records `target_expr IN (source keys)` as an extra read predicate of
-          |the transaction (it is also used to prune target files for the MERGE's own scan).
-          |Without it, a key-only ON condition such as `t.id = s.id` registers a read predicate of
-          |`true`, so any concurrently added file conflicts with the MERGE. With it, conflict-time
-          |data skipping (conflictDetection.dataSkipping.enabled, and especially the value-exact
-          |tier) can prove that concurrent MERGEs on disjoint keys do not conflict, while a
-          |concurrent change to any of this MERGE's keys (an update, or an insert of the same new
-          |key) still conflicts. When the number of distinct source key tuples exceeds
-          |merge.sourceKeyReadPredicate.maxKeys the predicate is not recorded and MERGE behaves
-          |exactly as when this flag is off.""".stripMargin)
+        """When enabled, a MERGE without NOT MATCHED BY SOURCE clauses records, as its read
+          |predicate, the target rows whose `target_expr = source_expr` equi-join keys (from the ON
+          |condition) equal the keys of some source row. Without it, a key-only ON condition such as
+          |`t.id = s.id` records a read predicate of `true`, so any concurrently added file
+          |conflicts with the MERGE. The predicate is a cheap pre-filter on the source keys (see
+          |merge.sourceKeyReadPredicate.inSetThreshold), which also prunes the MERGE's own target
+          |scan, plus an exact match that the value-exact conflict checks
+          |(conflictDetection.dataSkipping.valueExact.enabled) evaluate as a semi-join against the
+          |MERGE source, like Databricks Runtime. Concurrent MERGEs on disjoint keys then commit,
+          |while a concurrent change to any of this MERGE's keys (an update, or an insert of the
+          |same new key) still conflicts. There is no limit on the number of source keys.
+          |""".stripMargin)
       .booleanConf
       .createWithDefault(false)
 
-  val MERGE_SOURCE_KEY_READ_PREDICATE_MAX_KEYS =
-    buildConf("merge.sourceKeyReadPredicate.maxKeys")
+  val MERGE_SOURCE_KEY_READ_PREDICATE_IN_SET_THRESHOLD =
+    buildConf("merge.sourceKeyReadPredicate.inSetThreshold")
       .internal()
       .doc(
         """The maximum number of distinct source key tuples for which
-          |merge.sourceKeyReadPredicate.enabled records a `target_expr IN (source keys)` read
-          |predicate. The keys are collected to the driver, so this bounds driver memory and the
-          |size of the predicate evaluated during file pruning and conflict detection. Above the
-          |limit the MERGE falls back to its existing read predicates. A non-positive value
-          |disables the feature.""".stripMargin)
+          |merge.sourceKeyReadPredicate.enabled builds a `target_expr IN (source values)`
+          |pre-filter (the values are collected to the driver). Above it, the pre-filter is a
+          |`target_expr BETWEEN min AND max` range of the source values. This only affects pruning:
+          |the exact source-key match still decides the conflict, so a smaller value never causes
+          |a conflict the value-exact check would not. A non-positive value always uses the
+          |range.""".stripMargin)
       .intConf
-      .createWithDefault(100000)
+      .createWithDefault(10000)
 
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")

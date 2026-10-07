@@ -25,6 +25,7 @@ import org.apache.spark.sql.delta.metric.IncrementMetric
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.ClassicColumnConversions._
 import org.apache.spark.sql.delta.actions.{Action, AddFile, FileAction}
+import org.apache.spark.sql.delta.expressions.MergeSourceKeyMatch
 import org.apache.spark.sql.delta.commands.merge.{MergeIntoMaterializeSource, MergeIntoMaterializeSourceReason, MergeStats}
 import org.apache.spark.sql.delta.files.{TahoeBatchFileIndex, TahoeFileIndex, TransactionalWrite}
 import org.apache.spark.sql.delta.metering.DeltaLogging
@@ -39,8 +40,8 @@ import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
-import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.types.{AtomicType, StructType}
+import org.apache.spark.sql.functions.{col, max, min}
+import org.apache.spark.sql.types.{AtomicType, DataType, DoubleType, FloatType, StringType, StructType}
 
 trait MergeIntoCommandBase extends LeafRunnableCommand
   with DeltaCommand
@@ -388,14 +389,21 @@ trait MergeIntoCommandBase extends LeafRunnableCommand
 
   /**
    * The `(target, source)` expression pairs of the `target_expr = source_expr` conjuncts of the ON
-   * condition, where each side is deterministic, atomic-typed and references only its own side.
-   * Null-safe equality is excluded: a NULL source key would have to match NULL target keys, which
-   * an IN predicate cannot express.
+   * condition, where each side is deterministic and references only its own side, and both sides
+   * have the same atomic type whose equality is binary (so a pre-filter on the collected source
+   * values agrees with the join's `=`). Excluded: null-safe equality (NULL keys would match),
+   * FLOAT/DOUBLE (`-0.0 = 0.0` and NaN normalization) and non-binary string collations.
    */
   private def sourceTargetEquiJoinKeys: Seq[(Expression, Expression)] = {
+    def binaryComparable(dt: DataType): Boolean = dt match {
+      case _: FloatType | _: DoubleType => false
+      case st: StringType => st.supportsBinaryOrdering
+      case _: AtomicType => true
+      case _ => false
+    }
     def onlyReferences(e: Expression, side: AttributeSet): Boolean =
       e.deterministic && e.references.nonEmpty && e.references.subsetOf(side) &&
-        e.dataType.isInstanceOf[AtomicType]
+        binaryComparable(e.dataType)
     def keyPair(t: Expression, s: Expression): Option[(Expression, Expression)] =
       if (onlyReferences(t, target.outputSet) && onlyReferences(s, source.outputSet) &&
           DataTypeUtils.sameType(t.dataType, s.dataType)) {
@@ -410,46 +418,70 @@ trait MergeIntoCommandBase extends LeafRunnableCommand
   }
 
   /**
-   * Read predicates `target_expr IN (distinct source keys)`, one per equi-join key of the ON
-   * condition, recorded so that conflict detection knows which target rows this MERGE depends on.
+   * Read predicates recording which target rows this MERGE depends on: those whose equi-join
+   * key tuple equals the key tuple of some source row. Mirrors DBR's MERGE source read predicate
+   * (a join against the MERGE source, with no limit on the number of source keys).
    *
-   * A MERGE reads exactly the target rows that join with some source row (plus, for NOT MATCHED BY
-   * SOURCE, every other target row, so such MERGEs are excluded). Each target row that can satisfy
-   * the ON condition has every equi-join key value in the set of that key's non-null source values,
-   * so the conjunction of the per-key IN predicates is a sound over-approximation of the rows read,
-   * including the rows whose absence lets a NOT MATCHED clause insert. It is also sound for MATCHED
-   * clause conditions, which only narrow the joined rows.
+   * A MERGE reads exactly the target rows that join with some source row (plus, for NOT MATCHED
+   * BY SOURCE, every other target row, so such MERGEs are excluded). Any such row's key tuple is
+   * in the source's key tuples, so "key tuple in source keys" is a sound over-approximation of
+   * the rows read, including the rows whose absence lets a NOT MATCHED clause insert, and the
+   * rows a MATCHED clause condition only narrows.
    *
-   * Returns no predicate (the MERGE keeps its existing read predicates) when the feature is off,
-   * the ON condition has no usable equi-join key, a key has no non-null source value, or there are
-   * more than [[DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_MAX_KEYS]] distinct key tuples. The
-   * source is the same prepared (materialized, or deterministic) source the MERGE joins with, so
-   * the collected keys are the keys the join sees.
+   * Returned predicates (all ANDed in one read):
+   *  - per key, a cheap pre-filter on the source values: `target_key IN (values)` when there are at
+   *    most [[DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_IN_SET_THRESHOLD]] distinct key tuples,
+   *    else `target_key BETWEEN min AND max`. It prunes this MERGE's own target scan and is what
+   *    file-level (stats and partition) conflict checks use. A key with no non-null source value
+   *    matches no target row, so it becomes `false`.
+   *  - one [[MergeSourceKeyMatch]] carrying the source keys; the value-exact conflict checks
+   *    evaluate it as an exact semi-join, and it is `true` everywhere else.
+   *
+   * The source is the prepared (materialized, or deterministic) source the MERGE joins with, so the
+   * keys seen here and by the conflict check are the keys the MERGE join sees.
    */
   protected def getSourceKeyReadPredicates(spark: SparkSession): Seq[Expression] = {
-    val maxKeys = spark.conf.get(DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_MAX_KEYS)
     if (!spark.conf.get(DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED) ||
-        maxKeys <= 0 || notMatchedBySourceClauses.nonEmpty) {
+        notMatchedBySourceClauses.nonEmpty) {
       return Seq.empty
     }
     val keyPairs = sourceTargetEquiJoinKeys
     if (keyPairs.isEmpty) {
       return Seq.empty
     }
+    val inSetThreshold =
+      spark.conf.get(DeltaSQLConf.MERGE_SOURCE_KEY_READ_PREDICATE_IN_SET_THRESHOLD)
 
-    val keyColumns = keyPairs.zipWithIndex.map { case ((_, sourceKey), i) =>
-      Column(Alias(sourceKey, s"__merge_source_key_$i")())
-    }
-    val keyRows = getMergeSource.df.select(keyColumns: _*).distinct().limit(maxKeys + 1).collect()
-    val predicates = if (keyRows.length > maxKeys) {
-      None
-    } else {
-      val perKey = keyPairs.zipWithIndex.map { case ((targetKey, sourceKey), i) =>
+    val keyNames = keyPairs.indices.map(i => s"__merge_source_key_$i")
+    val sourceKeys = getMergeSource.df.select(keyPairs.zip(keyNames).map {
+      case ((_, sourceKey), name) => Column(Alias(sourceKey, name)())
+    }: _*)
+    val keyRows =
+      if (inSetThreshold > 0) sourceKeys.distinct().limit(inSetThreshold + 1).collect()
+      else Array.empty[Row]
+    val useInSet = inSetThreshold > 0 && keyRows.length <= inSetThreshold
+
+    val preFilters: Seq[Expression] = if (useInSet) {
+      keyPairs.zipWithIndex.map { case ((targetKey, sourceKey), i) =>
         val toCatalyst = CatalystTypeConverters.createToCatalystConverter(sourceKey.dataType)
         val values = keyRows.iterator.map(row => toCatalyst(row.get(i))).filter(_ != null).toSet
-        if (values.isEmpty) None else Some(InSet(targetKey, values))
+        if (values.isEmpty) Literal.FalseLiteral else InSet(targetKey, values)
       }
-      if (perKey.forall(_.isDefined)) Some(perKey.flatten) else None
+    } else {
+      val bounds = keyNames.flatMap(n => Seq(min(col(n)), max(col(n)))) match {
+        case aggs => sourceKeys.agg(aggs.head, aggs.tail: _*).head()
+      }
+      keyPairs.zipWithIndex.map { case ((targetKey, sourceKey), i) =>
+        val toCatalyst = CatalystTypeConverters.createToCatalystConverter(sourceKey.dataType)
+        val (lo, hi) = (toCatalyst(bounds.get(2 * i)), toCatalyst(bounds.get(2 * i + 1)))
+        if (lo == null) {
+          Literal.FalseLiteral
+        } else {
+          And(
+            GreaterThanOrEqual(targetKey, Literal(lo, sourceKey.dataType)),
+            LessThanOrEqual(targetKey, Literal(hi, sourceKey.dataType)))
+        }
+      }
     }
 
     recordDeltaEvent(
@@ -457,10 +489,10 @@ trait MergeIntoCommandBase extends LeafRunnableCommand
       opType = "delta.dml.merge.sourceKeyReadPredicate",
       data = Map(
         "numKeyColumns" -> keyPairs.size,
-        "numDistinctKeys" -> keyRows.length,
-        "maxKeys" -> maxKeys,
-        "applied" -> predicates.isDefined))
-    predicates.getOrElse(Seq.empty)
+        "inSetThreshold" -> inSetThreshold,
+        "preFilter" -> (if (useInSet) "inSet" else "range"),
+        "numDistinctKeys" -> (if (useInSet) keyRows.length.toLong else -1L)))
+    preFilters :+ MergeSourceKeyMatch(keyPairs.map(_._1), sourceKeys)
   }
 
   /**
