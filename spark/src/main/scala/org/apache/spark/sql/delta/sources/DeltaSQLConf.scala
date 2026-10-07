@@ -586,6 +586,38 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .longConf
       .createWithDefault(1L << 30) // 1 GiB
 
+  val MERGE_SOURCE_KEY_READ_PREDICATE_ENABLED =
+    buildConf("merge.sourceKeyReadPredicate.enabled")
+      .internal()
+      .doc(
+        """When enabled, MERGE (without NOT MATCHED BY SOURCE clauses) collects the distinct
+          |values of the source side of each `target_expr = source_expr` equi-join conjunct of the
+          |ON condition and records `target_expr IN (source keys)` as an extra read predicate of
+          |the transaction (it is also used to prune target files for the MERGE's own scan).
+          |Without it, a key-only ON condition such as `t.id = s.id` registers a read predicate of
+          |`true`, so any concurrently added file conflicts with the MERGE. With it, conflict-time
+          |data skipping (conflictDetection.dataSkipping.enabled, and especially the value-exact
+          |tier) can prove that concurrent MERGEs on disjoint keys do not conflict, while a
+          |concurrent change to any of this MERGE's keys (an update, or an insert of the same new
+          |key) still conflicts. When the number of distinct source key tuples exceeds
+          |merge.sourceKeyReadPredicate.maxKeys the predicate is not recorded and MERGE behaves
+          |exactly as when this flag is off.""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
+  val MERGE_SOURCE_KEY_READ_PREDICATE_MAX_KEYS =
+    buildConf("merge.sourceKeyReadPredicate.maxKeys")
+      .internal()
+      .doc(
+        """The maximum number of distinct source key tuples for which
+          |merge.sourceKeyReadPredicate.enabled records a `target_expr IN (source keys)` read
+          |predicate. The keys are collected to the driver, so this bounds driver memory and the
+          |size of the predicate evaluated during file pruning and conflict detection. Above the
+          |limit the MERGE falls back to its existing read predicates. A non-positive value
+          |disables the feature.""".stripMargin)
+      .intConf
+      .createWithDefault(100000)
+
   val DELTA_PROTOCOL_DEFAULT_WRITER_VERSION =
     buildConf("properties.defaults.minWriterVersion")
       .doc("The default writer protocol version to create new tables with, unless a feature " +
