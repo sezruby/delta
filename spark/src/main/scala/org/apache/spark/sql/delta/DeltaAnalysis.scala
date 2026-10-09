@@ -694,7 +694,7 @@ class DeltaAnalysis(protected val session: SparkSession)
       merge
 
     case reorg @ DeltaReorgTable(resolved @ ResolvedTable(_, _, _: DeltaTableV2, _), spec) =>
-      DeltaReorgTableCommand(resolved, spec)(reorg.predicates)
+      DeltaReorgTableCommand(resolved, spec)(reorg.predicates, applyPurgeFileSelection = true)
 
     case DeltaReorgTable(ResolvedTable(_, _, t, _), _) =>
       throw DeltaErrors.notADeltaTable(t.name())
