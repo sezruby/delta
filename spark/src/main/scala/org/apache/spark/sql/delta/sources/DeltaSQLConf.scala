@@ -3057,6 +3057,44 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .checkValue(_ <= 1, "maxDeletedRowsRatio must be in range [0.0, 1.0]")
       .createWithDefault(0.05d)
 
+  val DELTA_REORG_PURGE_MIN_DELETED_ROWS_RATIO =
+    buildConf("reorg.purge.minDeletedRowsRatio")
+      .doc(
+        """REORG TABLE ... APPLY (PURGE) only rewrites a file with deletion vectors when its ratio
+          |of deleted rows to physical rows is at least this value. Files without row-count
+          |statistics are always eligible. Files past
+          |`reorg.purge.maxDeletionVectorAge` are rewritten regardless. The default (0.0) rewrites
+          |every file with deletion vectors. Does not apply to purges run internally, for
+          |example when dropping the deletionVectors table feature.""".stripMargin)
+      .doubleConf
+      .checkValue(r => r >= 0 && r <= 1, "minDeletedRowsRatio must be in range [0.0, 1.0]")
+      .createWithDefault(0.0d)
+
+  val DELTA_REORG_PURGE_MIN_STABLE_DURATION =
+    buildConf("reorg.purge.minStableDuration")
+      .doc(
+        """REORG TABLE ... APPLY (PURGE) skips a file that was given a deletion vector by a
+          |data-changing commit within this duration, because it may still receive more deletes.
+          |Files past `reorg.purge.maxDeletionVectorAge` are rewritten regardless. The default (0)
+          |disables the check. Does not apply to purges run internally, for example when
+          |dropping the deletionVectors table feature.""".stripMargin)
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 0, "minStableDuration cannot be negative")
+      .createWithDefault(0L)
+
+  val DELTA_REORG_PURGE_MAX_DELETION_VECTOR_AGE =
+    buildConf("reorg.purge.maxDeletionVectorAge")
+      .doc(
+        """Upper bound for the filters set by `reorg.purge.minDeletedRowsRatio` and
+          |`reorg.purge.minStableDuration`. REORG TABLE ... APPLY (PURGE) always rewrites a file
+          |with deletion vectors when no data-changing commit within this duration gave it a
+          |deletion vector, so a soft-deleted row is purged by the first REORG that runs after
+          |this duration has passed since its file last got a deletion vector. Unset by
+          |default.""".stripMargin)
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 0, "maxDeletionVectorAge cannot be negative")
+      .createOptional
+
   val DELTA_TABLE_PROPERTY_CONSTRAINTS_CHECK_ENABLED =
     buildConf("tablePropertyConstraintsCheck.enabled")
       .internal()
