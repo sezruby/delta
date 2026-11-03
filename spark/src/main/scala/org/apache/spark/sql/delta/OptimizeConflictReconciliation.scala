@@ -48,12 +48,8 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
       DeletionVectorUtils.deletionVectorsWritable(
         currentTransactionInfo.protocol, currentTransactionInfo.metadata)
 
-  /**
-   * Whether the reverse direction (DML loses to a compaction OPTIMIZE) is enabled. `protected` so
-   * [[RowLevelConcurrencyResolution.canSkipAddedFileForRowLevelConcurrency]] (mixed into the same
-   * checker) can also let the reverse remap's re-added outputs skip the append check.
-   */
-  protected lazy val optimizeReverseReconciliationEnabled: Boolean =
+  /** Whether the reverse direction (DML loses to a compaction OPTIMIZE) is enabled. */
+  private lazy val optimizeReverseReconciliationEnabled: Boolean =
     spark.conf.get(DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED) &&
       DeletionVectorUtils.deletionVectorsWritable(
         currentTransactionInfo.protocol, currentTransactionInfo.metadata)
@@ -391,11 +387,19 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
         // tombstone would carry no composition tag, so a further concurrent loser aborts rather
         // than remapping onto an already-DV'd output. Nothing to strip here.
         val cRemoves = outputDv.keys.map(p => outByPath(p).removeWithTimestamp()).toSeq
-        val cAdds = outputDv.map { case (p, bmp) =>
-          val desc = writeMergedDeletionVector(dvStore, tablePath, bmp)
-          outByPath(p).copy(deletionVector = desc, dataChange = true)
-            .withoutTightBoundStats
-        }.toSeq
+        // Packed into new DV files with the table's random prefixes, as in the forward remap.
+        val writer = new PackedDeletionVectorWriter(
+          dvStore,
+          tablePath,
+          spark.conf.get(DeltaSQLConf.DELETION_VECTOR_PACKING_TARGET_SIZE),
+          DeltaUtils.getRandomPrefixLength(currentTransactionInfo.metadata))
+        val cAdds = SparkUtils.tryWithSafeFinally {
+          outputDv.map { case (p, bmp) =>
+            val desc = writer.write(bmp)
+            outByPath(p).copy(deletionVector = desc, dataChange = true)
+              .withoutTightBoundStats
+          }.toSeq
+        }(writer.close())
 
         // Drop the DML's now-remapped AddFile/RemoveFile for the resolved sources; their deletions
         // now live on the compacted output instead.
@@ -405,15 +409,18 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
           case _ => false
         } ++ cRemoves ++ cAdds
 
-        // A pure compaction is a dataChange=false relocation: mark ALL of its removed sources and
-        // outputs resolved so neither the delete-read check (removed sources the DML read) nor the
-        // append check (outputs, via canSkipAddedFileForRowLevelConcurrency) re-triggers.
-        winnerRemoveByPath.keys.foreach(rowLevelResolvedPaths += _)
-        winnerOutputs.foreach(rowLevelResolvedPaths += _.path)
+        // A pure compaction is a dataChange=false relocation: drop ALL of its removed sources and
+        // outputs from the winning summary so neither the delete-read check (removed sources the
+        // DML read) nor the append check (outputs) re-triggers.
+        // Both are computed before either is assigned, as in the forward remap.
+        val prunedSummary = pruneReconciledFiles(
+          winningCommitSummary, winnerRemoveByPath.keySet ++ winnerOutputs.map(_.path))
         val newReadFiles = currentTransactionInfo.readFiles
           .filterNot(f => winnerRemoveByPath.contains(f.path))
-        currentTransactionInfo =
+        val rebasedInfo =
           currentTransactionInfo.copy(actions = newActions, readFiles = newReadFiles)
+        winningCommitSummary = prunedSummary
+        currentTransactionInfo = rebasedInfo
 
         recordDeltaEvent(
           deltaLog,
