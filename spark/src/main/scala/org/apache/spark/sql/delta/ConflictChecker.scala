@@ -277,10 +277,10 @@ object WinningCommitSummary {
 private[delta] class ConflictChecker(
     protected val spark: SparkSession,
     initialCurrentTransactionInfo: CurrentTransactionInfo,
-    // A `var` (reassigned once by [[prepareRowLevelConflictResolution]]) to drop files that are
-    // resolved at the row level, mirroring how `currentTransactionInfo` is rebased. After that the
-    // file-level checks run against a summary that never mentions those files, so they need no
-    // changes.
+    // A `var` (reassigned by [[prepareRowLevelConflictResolution]] and the OPTIMIZE
+    // reconciliation) to drop files that are resolved at the row level, mirroring how
+    // `currentTransactionInfo` is rebased. After that the file-level checks run against a summary
+    // that never mentions those files, so they need no changes.
     protected var winningCommitSummary: WinningCommitSummary,
     isolationLevel: IsolationLevel,
     // Whether the commit holds the table's commit lock while checking conflicts, as

@@ -25,6 +25,9 @@ import org.apache.spark.sql.delta.deletionvectors.RoaringBitmapArray
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.storage.dv.DeletionVectorStore
+import org.apache.spark.sql.delta.util.{Utils => DeltaUtils}
+
+import org.apache.spark.util.{Utils => SparkUtils}
 
 /**
  * OPTIMIZE-vs-concurrent-DML reconciliation for the [[ConflictChecker]]: when a compaction OPTIMIZE
@@ -32,7 +35,7 @@ import org.apache.spark.sql.delta.storage.dv.DeletionVectorStore
  * vector onto the compacted output (offset arithmetic) instead of aborting.
  *
  * Mixed into [[ConflictChecker]] as a self-typed trait alongside [[RowLevelConcurrencyResolution]],
- * whose `readDeletionVectorOrEmpty` / `writeMergedDeletionVector` / `rowLevelResolvedPaths` /
+ * whose `readDeletionVectorOrEmpty` / `PackedDeletionVectorWriter` / `pruneReconciledFiles` /
  * `winningOperationName` members it reuses (both traits share the same `ConflictChecker`
  * self-type). Lives in its own file to keep ConflictChecker focused on file-level conflict
  * detection. The static composition parser stays in `object ConflictChecker` as
@@ -160,16 +163,22 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
       // Reconcile only if every conflicting source was remappable; a partial remap could leave an
       // un-reconciled conflict, so otherwise leave everything to the standard checks (abort).
       if (allResolvable && outputDv.nonEmpty) {
-        // Each compacted output gets the remapped/unioned DV.
-        val addReplacements: Map[String, AddFile] = outputDv.keys.iterator
-          .map { p =>
-            // Writes a new DV file as a side effect of conflict resolution. If this commit later
-            // aborts or retries against another winner, the file is unreferenced and reclaimed by
-            // VACUUM (same lifecycle as any DV the DML write path persists). See the note on
-            // `writeMergedDeletionVector`.
-            val desc = writeMergedDeletionVector(dvStore, tablePath, outputDv(p))
+        // Each compacted output gets the remapped/unioned DV, packed into new DV files with the
+        // table's random prefixes, as row-level concurrency writes its merged DVs. Writes DV files
+        // as a side effect of conflict resolution: if this commit later aborts or retries against
+        // another winner, they are unreferenced and reclaimed by VACUUM (same lifecycle as any DV
+        // the DML write path persists).
+        val writer = new PackedDeletionVectorWriter(
+          dvStore,
+          tablePath,
+          spark.conf.get(DeltaSQLConf.DELETION_VECTOR_PACKING_TARGET_SIZE),
+          DeltaUtils.getRandomPrefixLength(currentTransactionInfo.metadata))
+        val addReplacements: Map[String, AddFile] = SparkUtils.tryWithSafeFinally {
+          outputDv.keys.iterator.map { p =>
+            val desc = writer.write(outputDv(p))
             p -> currentAddByPath(p).copy(deletionVector = desc).withoutTightBoundStats
           }.toMap
+        }(writer.close())
         // Re-point each resolved source's RemoveFile at the winner's post-image (path + winning
         // DV). The OPTIMIZE read the pre-winner version, so its (path, no-DV) RemoveFile would not
         // match the winner's now-live (path, DV) file and would leave it undeleted (files are
@@ -186,12 +195,17 @@ trait OptimizeConflictReconciliation extends DeltaLogging { self: ConflictChecke
           case r: RemoveFile if removeReplacements.contains(r.path) => removeReplacements(r.path)
           case other => other
         }
-        // The reconciled sources are no longer read/delete conflicts for the standard checks.
-        resolvedSources.foreach(rowLevelResolvedPaths += _)
+        // The reconciled sources are no longer read/delete conflicts for the standard checks: drop
+        // them from the winning summary, as row-level concurrency does for the files it merges.
+        // Both are computed before either is assigned, so the summary is never pruned without the
+        // transaction being rebased.
+        val prunedSummary = pruneReconciledFiles(winningCommitSummary, resolvedSources.toSet)
         val newReadFiles = currentTransactionInfo.readFiles
           .filterNot(f => resolvedSources.contains(f.path))
-        currentTransactionInfo =
+        val rebasedInfo =
           currentTransactionInfo.copy(actions = newActions, readFiles = newReadFiles)
+        winningCommitSummary = prunedSummary
+        currentTransactionInfo = rebasedInfo
 
         recordDeltaEvent(
           deltaLog,

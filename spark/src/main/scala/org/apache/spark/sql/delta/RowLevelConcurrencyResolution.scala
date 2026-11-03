@@ -494,7 +494,7 @@ trait RowLevelConcurrencyResolution extends DeltaLogging { self: ConflictChecker
    * transaction read Q. Excluding such re-adds and checking the winner's newly deleted rows of Q
    * against the current transaction's reads is a separate change.
    */
-  private def pruneReconciledFiles(
+  protected def pruneReconciledFiles(
       summary: WinningCommitSummary,
       resolvedPaths: Set[String]): WinningCommitSummary = {
     val prunedActions = summary.actions.filterNot {
@@ -720,7 +720,7 @@ trait RowLevelConcurrencyResolution extends DeltaLogging { self: ConflictChecker
   }
 
   /** Reads a deletion vector into a [[RoaringBitmapArray]], returning an empty bitmap for none. */
-  private def readDeletionVectorOrEmpty(
+  protected def readDeletionVectorOrEmpty(
       dvStore: DeletionVectorStore,
       dv: DeletionVectorDescriptor,
       tablePath: Path): RoaringBitmapArray = {
@@ -732,7 +732,7 @@ trait RowLevelConcurrencyResolution extends DeltaLogging { self: ConflictChecker
    * random prefix of `prefixLength` characters, as the DML write path does (see
    * [[DeletionVectorWriter.createMapperToStoreDeletionVectors]]).
    */
-  private class PackedDeletionVectorWriter(
+  protected class PackedDeletionVectorWriter(
       dvStore: DeletionVectorStore,
       tablePath: Path,
       targetSize: Long,
