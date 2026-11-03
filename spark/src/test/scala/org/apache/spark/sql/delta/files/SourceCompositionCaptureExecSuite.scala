@@ -89,7 +89,10 @@ class SourceCompositionCaptureExecSuite extends QueryTest with DeltaSQLCommandTe
   test("compaction OPTIMIZE tags each multi-row-group source as one contiguous run") {
     withTempDir { dir =>
       val path = dir.getCanonicalPath
+      // The writer must see the row-group size, and the test restores it below.
+      // scalastyle:off hadoopconfiguration
       val hadoopConf = spark.sparkContext.hadoopConfiguration
+      // scalastyle:on hadoopconfiguration
       val prevBlockSize = hadoopConf.get("parquet.block.size")
       // A tiny row-group size so each source file is written as MANY row groups -- the multi-piece
       // read that would defeat capture if a source were split across partitions. The pinned read
