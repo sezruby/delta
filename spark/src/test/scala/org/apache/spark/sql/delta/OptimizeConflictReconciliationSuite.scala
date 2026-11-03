@@ -87,8 +87,9 @@ class OptimizeConflictReconciliationSuite extends QueryTest
    *
    * OPTIMIZE auto-resolves and RETRIES on abort, so the single-observer `runTxnsWithOrder` helpers
    * cannot drive it -- the retry's second commit is an unexpected phase transition. This mirrors
-   * upstream `OptimizeConflictSuite`: give the retry its own [[PhaseLockingTransactionExecutionObserver]]
-   * chained via `setNextObserver`, then let the abort surface.
+   * upstream `OptimizeConflictSuite`: give the retry its own
+   * [[PhaseLockingTransactionExecutionObserver]] chained via `setNextObserver`, then let the abort
+   * surface.
    */
   private def runOptimizeLoserExpectingAbort(
       dir: File,
@@ -173,9 +174,9 @@ class OptimizeConflictReconciliationSuite extends QueryTest
       assert(files.length === 1, s"expected a single compacted file, got ${files.length}")
       assert(deletionVectorCardinalities(log) === Seq(1L),
         "compacted output should carry the remapped deletion vector")
-      // F2: every RemoveFile in the reconciled OPTIMIZE commit must be dataChange=false. An OPTIMIZE
-      // is a data-preserving relocation; a dataChange=true reconciled tombstone would break
-      // streaming/CDC transparency and mix dataChange values within the one commit.
+      // F2: every RemoveFile in the reconciled OPTIMIZE commit must be dataChange=false. An
+      // OPTIMIZE is a data-preserving relocation; a dataChange=true reconciled tombstone would
+      // break streaming/CDC transparency and mix dataChange values within the one commit.
       val removes = lastCommitRemoveFiles(log)
       assert(removes.nonEmpty, "reconciled OPTIMIZE commit should contain source tombstones")
       assert(removes.forall(!_.dataChange),
@@ -342,9 +343,9 @@ class OptimizeConflictReconciliationSuite extends QueryTest
   test("reverse direction: a losing DELETE against a compacted file still aborts") {
     withTempDir { dir =>
       val log = createMultiFileTable(dir)
-      // Only the OPTIMIZE-loser direction is reconciled here. When OPTIMIZE wins (commits first) and
-      // the DELETE loses, the delete's target file was compacted away; DELETE-loser reconciliation
-      // is a separate follow-up, so the loser aborts.
+      // Only the OPTIMIZE-loser direction is reconciled here. When OPTIMIZE wins (commits first)
+      // and the DELETE loses, the delete's target file was compacted away; DELETE-loser
+      // reconciliation is a separate follow-up, so the loser aborts.
       val txnDelete = sqlTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150", reconcile = true)
       val txnOptimize = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = true)
 
@@ -364,8 +365,9 @@ class OptimizeConflictReconciliationSuite extends QueryTest
     withTempDir { dir =>
       val log = createPartitionedMultiFileTable(dir)
       // The partitioned case F1 fixes: the writer's required ordering is the partition column, so
-      // the capture must report that (constant-within-bin) ordering, or a SortExec is inserted above
-      // the capture and the recorded offsets become scan order rather than physical write order.
+      // the capture must report that (constant-within-bin) ordering, or a SortExec is inserted
+      // above the capture and the recorded offsets become scan order rather than physical write
+      // order.
       // End-to-end this reconciles like the unpartitioned case: both commit, exactly id=150 gone.
       val txnA = sqlTxn(s"OPTIMIZE ${tableRef(dir)}", reconcile = true)
       val txnB = sqlTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150", reconcile = true)
