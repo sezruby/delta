@@ -427,15 +427,18 @@ class OptimizeConflictReconciliationSuite extends QueryTest
   private val reverseKey =
     DeltaSQLConf.DELTA_OPTIMIZE_CONFLICT_RECONCILIATION_REVERSE_ENABLED.key
 
-  /** A transaction with reverse reconciliation enabled (needed on both the OPTIMIZE and the DML). */
-  private def reverseTxn(sqlText: String, extraConf: Seq[(String, String)] = Nil): () => Array[Row] =
+  /** A transaction with reverse reconciliation on (needed on both the OPTIMIZE and the DML). */
+  private def reverseTxn(
+      sqlText: String,
+      extraConf: Seq[(String, String)] = Nil): () => Array[Row] =
     sqlTxn(sqlText, reconcile = false, (reverseKey -> "true") +: extraConf)
 
   test("reverse: a losing DELETE remaps its DV onto the winning compaction output") {
     withTempDir { dir =>
       val log = createMultiFileTable(dir)
-      // A (loser): DELETE id=150. B (winner): OPTIMIZE compacts all files (persisting composition).
-      // A's target file is compacted away; instead of aborting, A remaps its delete onto the output.
+      // A (loser): DELETE id=150. B (winner): OPTIMIZE compacts all files (persisting
+      // composition). A's target file is compacted away; instead of aborting, A remaps its delete
+      // onto the output.
       val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
       val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)}")
 
@@ -456,10 +459,11 @@ class OptimizeConflictReconciliationSuite extends QueryTest
   test("reverse: losing DELETE remaps correctly across an OPTIMIZE-time read gap") {
     withTempDir { dir =>
       val log = createMultiFileTable(dir)
-      // Pre-existing DV: id=100 (physical row 0 of the middle file) is deleted before either txn, so
-      // the OPTIMIZE excludes it from the output and the middle file's live rows start at physical
-      // index 1. The losing delete of id=150 (physical row 50) must land at live-rank 50-1=49 plus
-      // the first file's 100 rows -> output position 149, discounting the OPTIMIZE-time gap.
+      // Pre-existing DV: id=100 (physical row 0 of the middle file) is deleted before either txn,
+      // so the OPTIMIZE excludes it from the output and the middle file's live rows start at
+      // physical index 1. The losing delete of id=150 (physical row 50) must land at live-rank
+      // 50-1=49 plus the first file's 100 rows -> output position 149, discounting the
+      // OPTIMIZE-time gap.
       sql(s"DELETE FROM ${tableRef(dir)} WHERE id = 100")
       assert(deletionVectorCardinalities(log) === Seq(1L), "pre-existing DV expected on one file")
 
@@ -497,7 +501,8 @@ class OptimizeConflictReconciliationSuite extends QueryTest
 
       // Old id=150 masked, new id=1150 present, everything else intact.
       assert(ids(dir) === ((0L until 300L).filterNot(_ == 150L) :+ 1150L).sorted)
-      // The compacted output carries the remapped DV (cardinality 1); the fresh image file has none.
+      // The compacted output carries the remapped DV (cardinality 1); the fresh image file has
+      // none.
       assert(deletionVectorCardinalities(log) === Seq(1L),
         "compacted output should carry the remapped DV for the updated row")
     }
@@ -527,8 +532,8 @@ class OptimizeConflictReconciliationSuite extends QueryTest
   test("reverse: aborts against a reclustering (ZORDER) winner") {
     withTempDir { dir =>
       val log = createMultiFileTable(dir)
-      // ZORDER permutes rows, so the OPTIMIZE captures no composition even with the reverse flag on;
-      // the losing DML cannot remap (no offset mapping exists) and aborts.
+      // ZORDER permutes rows, so the OPTIMIZE captures no composition even with the reverse flag
+      // on; the losing DML cannot remap (no offset mapping exists) and aborts.
       val txnDelete = reverseTxn(s"DELETE FROM ${tableRef(dir)} WHERE id = 150")
       val txnOptimize = reverseTxn(s"OPTIMIZE ${tableRef(dir)} ZORDER BY (id)")
 
