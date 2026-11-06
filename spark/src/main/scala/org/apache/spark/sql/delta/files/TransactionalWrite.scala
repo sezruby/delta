@@ -407,7 +407,23 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       inputData: Dataset[_],
       writeOptions: Option[DeltaOptions],
       isOptimize: Boolean,
-      additionalConstraints: Seq[Constraint]): Seq[FileAction] = {
+      additionalConstraints: Seq[Constraint]): Seq[FileAction] =
+    writeFiles(inputData, writeOptions, isOptimize, additionalConstraints,
+      sourceCompositionCapture = None)
+
+  /**
+   * [[writeFiles]] plus OPTIMIZE compaction conflict-reconciliation: when
+   * `sourceCompositionCapture` is set, a `SourceCompositionCaptureExec` is injected to observe the
+   * output's source composition (file identity + per-file row count) into that accumulator. No
+   * helper columns are added; rows pass through unchanged. Kept as a separate overload so the
+   * public [[writeFiles]] signature above is undisturbed for its many callers.
+   */
+  def writeFiles(
+      inputData: Dataset[_],
+      writeOptions: Option[DeltaOptions],
+      isOptimize: Boolean,
+      additionalConstraints: Seq[Constraint],
+      sourceCompositionCapture: Option[SourceCompositionAccumulator]): Seq[FileAction] = {
     hasWritten = true
 
     val spark = inputData.sparkSession
@@ -457,11 +473,24 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
       val checkInvariants = DeltaInvariantCheckerExec(spark, empty2NullPlan, constraints)
       // No need to plan optimized write if the write command is OPTIMIZE, which aims to produce
       // evenly-balanced data files already.
-      val physicalPlan = if (!isOptimize &&
+      val basePlan = if (!isOptimize &&
         shouldOptimizeWrite(writeOptions, spark.sessionState.conf)) {
         DeltaOptimizedWriterExec(checkInvariants, metadata.partitionColumns, deltaLog)
       } else {
         checkInvariants
+      }
+      // OPTIMIZE compaction conflict-reconciliation: observe the source composition (file identity
+      // from InputFileBlockHolder + per-file row count) while rows pass through unchanged. No
+      // helper column to strip; the driver derives physical offsets from the per-file counts.
+      val physicalPlan = sourceCompositionCapture match {
+        // Report the partition-column ordering (constant within a compaction bin) so the writer's
+        // required ordering is satisfied and no SortExec is inserted above the capture, which would
+        // reorder rows and break the recorded write-order offsets. Empty (Nil) for unpartitioned
+        // tables, where the writer's required ordering is already empty.
+        case Some(acc) =>
+          SourceCompositionCaptureExec(
+            basePlan, acc, partitioningColumns.map(SortOrder(_, Ascending)))
+        case None => basePlan
       }
 
       val statsTrackers: ListBuffer[WriteJobStatsTracker] = ListBuffer()
