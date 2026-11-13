@@ -4284,7 +4284,10 @@ trait DeltaErrorsBase
     new DeltaAnalysisException(
       errorClass = "DELTA_REPLACE_PARTITIONED_BY_PARTITION_COLUMNS_NOT_MATERIALIZED",
       messageParameters = Array(
-        partitionColumns.mkString(", "), numFiles.toString, examplePaths.mkString(", ")))
+        partitionColumns.mkString(", "),
+        numFiles.toString,
+        examplePaths.mkString(", "),
+        DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES.key))
   }
 
   def createTableWithDifferentClusteringException(

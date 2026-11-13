@@ -3455,6 +3455,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES =
+    buildConf("alterTable.replacePartitionedBy.rewriteNonMaterializedFiles")
+      .internal()
+      .doc("""When true, ALTER TABLE ... REPLACE PARTITIONED BY WITH CLUSTER BY rewrites the data
+        |files that do not physically store the partition columns, so that the partition column
+        |values are stored in the new files. When false, the command fails if such files exist.
+        |""".stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_LOG_CACHE_SIZE = buildConf("delta.log.cacheSize")
     .internal()
     .doc("The maximum number of DeltaLog instances to cache in memory.")

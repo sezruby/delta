@@ -2763,7 +2763,7 @@
   "DELTA_REPLACE_PARTITIONED_BY_PARTITION_COLUMNS_NOT_MATERIALIZED" : {
     "message" : [
       "Cannot replace the partitioning of the table because the partition column(s) <partitionColumns> are not stored in <numFiles> data file(s), for example: <examplePaths>.",
-      "Rewrite these files so that they contain the partition column values before running ALTER TABLE REPLACE PARTITIONED BY."
+      "Enable <config> to rewrite these files as part of the command, or rewrite them so that they contain the partition column values before running ALTER TABLE REPLACE PARTITIONED BY."
     ],
     "sqlState" : "55000"
   },

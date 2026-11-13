@@ -24,7 +24,7 @@ import scala.util.Try
 import org.apache.spark.sql.delta.skipping.clustering.ClusteredTableUtils
 import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
 import org.apache.spark.sql.delta._
-import org.apache.spark.sql.delta.actions.{Action, Metadata}
+import org.apache.spark.sql.delta.actions.{Action, AddFile, FileAction, Metadata}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.delta.schema.SchemaMergingUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -45,23 +45,27 @@ import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.SerializableConfiguration
 
 /**
- * Command that replaces the partitioning of a Delta table with clustering, without rewriting
- * any data file:
+ * Command that replaces the partitioning of a Delta table with clustering:
  *  - ALTER TABLE .. REPLACE PARTITIONED BY WITH CLUSTER BY (col1, col2, ...)
  *  - ALTER TABLE .. REPLACE PARTITIONED BY WITH CLUSTER BY NONE
  *
- * The conversion is a single metadata-only commit which
- *  1. clears the partition columns in the table metadata,
- *  2. re-adds every active file with empty `partitionValues` and `dataChange = false`, keeping its
- *     path, deletion vector and row tracking fields. Per-file min/max/nullCount statistics are
- *     synthesized for the former partition columns from the (constant) partition values so that
- *     data skipping on these columns keeps working, and
- *  3. when clustering columns are given, enables clustering and records the clustering columns.
- *
  * After the conversion the former partition columns are read from the data files, so they must be
  * physically stored in every data file (see `delta.writePartitionColumnsToParquet` and the
- * `materializePartitionColumns` table feature). This is verified by reading the Parquet footers
- * before committing.
+ * `materializePartitionColumns` table feature). The command reads the Parquet footers of all data
+ * files to find the files that do not store them.
+ *
+ * The conversion is a single commit which
+ *  1. clears the partition columns in the table metadata,
+ *  2. re-adds every file that stores the partition columns with empty `partitionValues` and
+ *     `dataChange = false`, keeping its path, deletion vector and row tracking fields. Per-file
+ *     min/max/nullCount statistics are synthesized for the former partition columns from the
+ *     (constant) partition values so that data skipping on these columns keeps working,
+ *  3. rewrites every file that does not store the partition columns (if any), like OPTIMIZE does:
+ *     the new files store all columns, deletion vectors are applied and row IDs and row commit
+ *     versions are preserved, and
+ *  4. when clustering columns are given, enables clustering and records the clustering columns.
+ *
+ * If all files store the partition columns, the conversion does not rewrite any data.
  *
  * When a former partition column would not get statistics anymore, because it is after the first
  * `delta.dataSkippingNumIndexedCols` columns or not in `delta.dataSkippingStatsColumns`, the
@@ -121,19 +125,33 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
         Nil
       }
 
-      if (conf.getConf(
+      val filesToRewrite = if (conf.getConf(
           DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_VERIFY_MATERIALIZED_PARTITION_COLUMNS)) {
-        ReplacePartitionedByUtils.verifyPartitionColumnsMaterialized(
-          sparkSession, deltaLog, snapshot, oldMetadata.partitionColumns,
-          physicalPartitionSchema.fieldNames.toSeq)
+        ReplacePartitionedByUtils.findFilesWithoutPartitionColumns(
+          sparkSession, deltaLog, snapshot, physicalPartitionSchema.fieldNames.toSeq)
+      } else {
+        Seq.empty
       }
+      if (filesToRewrite.nonEmpty && !conf.getConf(
+          DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES)) {
+        throw DeltaErrors.replacePartitionedByPartitionColumnsNotMaterializedException(
+          oldMetadata.partitionColumns,
+          filesToRewrite.size,
+          filesToRewrite.take(ReplacePartitionedByUtils.NUM_EXAMPLE_FILES).map(_.path))
+      }
+
+      // Must run after the metadata update, so that the new files store all columns.
+      val rewriteActions =
+        ReplacePartitionedByUtils.rewriteFiles(sparkSession, txn, snapshot, filesToRewrite)
 
       val stringPrefixLength = conf.getConf(DeltaSQLConf.DATA_SKIPPING_STRING_PREFIX_LENGTH)
       val timeZoneId = conf.sessionLocalTimeZone
       val partitionFields = physicalPartitionSchema.fields.toSeq
+      val rewrittenPaths = sparkSession.sparkContext.broadcast(filesToRewrite.map(_.path).toSet)
       import org.apache.spark.sql.delta.implicits._
       val newAddFiles = snapshot.allFiles.mapPartitions { files =>
-        files.map { file =>
+        val skip = rewrittenPaths.value
+        files.filterNot(file => skip.contains(file.path)).map { file =>
           file.copy(
             partitionValues = Map.empty,
             dataChange = false,
@@ -143,7 +161,12 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
       }
 
       val actions: Iterator[Action] =
-        newAddFiles.toLocalIterator().asScala ++ domainMetadata.iterator
+        rewriteActions.iterator ++ newAddFiles.toLocalIterator().asScala ++ domainMetadata.iterator
+      val metrics = Map(
+        "numRewrittenFiles" -> filesToRewrite.size.toString,
+        "numRewrittenBytes" -> filesToRewrite.map(_.size).sum.toString,
+        "numAddedFilesFromRewrite" ->
+          rewriteActions.count(_.isInstanceOf[AddFile]).toString)
       val newProtocolOpt =
         if (txn.protocol != snapshot.protocol) Some(txn.protocol) else None
       txn.commitLarge(
@@ -154,7 +177,7 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
           oldMetadata.partitionColumns.mkString(","),
           newLogicalClusteringColumns.mkString(",")),
         context = Map.empty,
-        metrics = Map.empty,
+        metrics = metrics,
         dataChange = Some(false))
     }
     Seq.empty[Row]
@@ -163,28 +186,27 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
 
 object ReplacePartitionedByUtils {
 
-  private val NUM_EXAMPLE_FILES = 5
+  val NUM_EXAMPLE_FILES = 5
 
   /**
-   * Verifies that every active data file of the snapshot physically stores all the given
+   * Returns the active data files of the snapshot that do not physically store all the given
    * partition columns, by reading the Parquet footers of the files.
    */
-  def verifyPartitionColumnsMaterialized(
+  def findFilesWithoutPartitionColumns(
       spark: SparkSession,
       deltaLog: DeltaLog,
       snapshot: Snapshot,
-      logicalPartitionColumns: Seq[String],
-      physicalPartitionColumns: Seq[String]): Unit = {
+      physicalPartitionColumns: Seq[String]): Seq[AddFile] = {
     val broadcastConf = spark.sparkContext.broadcast(
       new SerializableConfiguration(deltaLog.newDeltaHadoopConf()))
     val dataRootDir = deltaLog.dataPath.toString
     val requiredColumns = physicalPartitionColumns.map(_.toLowerCase(Locale.ROOT))
 
     import org.apache.spark.sql.delta.implicits._
-    val filesMissingColumns = snapshot.allFiles.select("path").as[String].mapPartitions { paths =>
+    snapshot.allFiles.mapPartitions { files =>
       val conf = broadcastConf.value.value
-      paths.filter { relativePath =>
-        val path = DeltaFileOperations.absolutePath(dataRootDir, relativePath)
+      files.filter { file =>
+        val path = DeltaFileOperations.absolutePath(dataRootDir, file.path)
         val status = path.getFileSystem(conf).getFileStatus(path)
         val footer = ParquetFooterReaderShims.readParquetFooter(
           conf, status, ParquetMetadataConverter.SKIP_ROW_GROUPS)
@@ -192,13 +214,34 @@ object ReplacePartitionedByUtils {
           .map(_.getName.toLowerCase(Locale.ROOT)).toSet
         !requiredColumns.forall(fileColumns.contains)
       }
-    }
+    }.collect().toSeq
+  }
 
-    val examples = filesMissingColumns.take(NUM_EXAMPLE_FILES)
-    if (examples.nonEmpty) {
-      throw DeltaErrors.replacePartitionedByPartitionColumnsNotMaterializedException(
-        logicalPartitionColumns, filesMissingColumns.count(), examples.toSeq)
+  /**
+   * Rewrites the given files with the metadata of the transaction, which must not have partition
+   * columns anymore, so that the new files store all columns. Deletion vectors are applied, and
+   * row IDs and row commit versions are preserved like in OPTIMIZE. Returns the new files and the
+   * removal of the given files, all with `dataChange = false`.
+   */
+  def rewriteFiles(
+      spark: SparkSession,
+      txn: OptimisticTransaction,
+      snapshot: Snapshot,
+      files: Seq[AddFile]): Seq[FileAction] = {
+    if (files.isEmpty) return Seq.empty
+    require(txn.metadata.partitionColumns.isEmpty,
+      "The partitioning must be dropped before rewriting the files")
+    var input = txn.deltaLog.createDataFrame(
+      snapshot, files, actionTypeOpt = Some("ReplacePartitionedBy"))
+    input = RowTracking.preserveRowTrackingColumns(input, snapshot)
+    val addFiles = txn.writeFiles(input, None, isOptimize = true, Nil).collect {
+      case a: AddFile => a.copy(dataChange = false)
+      case other =>
+        throw new IllegalStateException(
+          s"Unexpected action $other with type ${other.getClass} while rewriting files")
     }
+    val timestamp = System.currentTimeMillis()
+    addFiles ++ files.map(_.removeWithTimestamp(timestamp, dataChange = false))
   }
 
   /**
