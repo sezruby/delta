@@ -16,9 +16,11 @@
 
 package org.apache.spark.sql.delta.skipping.clustering
 
+import java.io.File
+
 import org.apache.spark.sql.delta.skipping.ClusteredTableTestUtils
 import org.apache.spark.sql.delta.skipping.clustering.temp.{AlterTableReplacePartitionedByWithClusterBy, ClusterBySpec}
-import org.apache.spark.sql.delta.{DeltaAnalysisException, DeltaLog}
+import org.apache.spark.sql.delta.{DeltaAnalysisException, DeltaConfigs, DeltaLog, DeltaOperations}
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.commands.ReplacePartitionedByUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -26,9 +28,10 @@ import org.apache.spark.sql.delta.stats.DataSkippingDeltaTestsUtils
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.util.JsonUtils
 
-import org.apache.spark.sql.{QueryTest, Row}
+import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedTable
-import org.apache.spark.sql.types.{DateType, IntegerType, StringType, StructField, TimestampType}
+import org.apache.spark.sql.streaming.{StreamingQueryException, Trigger}
+import org.apache.spark.sql.types.{ByteType, DateType, DecimalType, IntegerType, StringType, StructField, TimestampType}
 
 class ReplacePartitionedByWithClusterBySuite
   extends QueryTest
@@ -83,6 +86,8 @@ class ReplacePartitionedByWithClusterBySuite
       assert(after.allFiles.collect().map(_.path).toSet ===
         before.allFiles.collect().map(_.path).toSet)
       assert(after.allFiles.collect().forall(_.partitionValues.isEmpty))
+      // All columns of a narrow table have statistics without listing them.
+      assert(statsColumnsOf(deltaLog).isEmpty)
       checkAnswer(readTable(path), expected)
 
       val lastCommit = deltaLog.history.getHistory(Some(1)).head
@@ -290,23 +295,164 @@ class ReplacePartitionedByWithClusterBySuite
   test("addPartitionValuesToStats") {
     val fields = Seq(
       StructField("s", StringType), StructField("i", IntegerType),
-      StructField("d", DateType), StructField("t", TimestampType), StructField("n", StringType))
+      StructField("d", DateType), StructField("t", TimestampType), StructField("n", StringType),
+      StructField("dec", DecimalType(10, 2)), StructField("e", StringType),
+      StructField("ei", IntegerType), StructField("x", IntegerType), StructField("b", ByteType))
     val stats =
       """{"numRecords":3,"minValues":{"id":1},"maxValues":{"id":3},"nullCount":{"id":0}}"""
-    val values = Map("s" -> "abc", "i" -> "7", "d" -> "2024-01-02",
-      "t" -> "2024-01-02 03:04:05", "n" -> null)
+    val values = Map("s" -> "abc", "i" -> " 7", "d" -> "2024-01-02",
+      "t" -> "2024-01-02 03:04:05", "n" -> null, "dec" -> "1.5",
+      // Empty strings and values that cannot be cast to the column type get no statistics.
+      "e" -> "", "ei" -> "", "x" -> "abc", "b" -> "300")
+    def addStats(stats: String, values: Map[String, String], fields: Seq[StructField]): String =
+      ReplacePartitionedByUtils.addPartitionValuesToStats(stats, values, fields, 32, "UTC")
     val result = JsonUtils.fromJson[Map[String, Map[String, Any]]](
-      ReplacePartitionedByUtils.addPartitionValuesToStats(stats, values, fields, 32)
-        .replace("\"numRecords\":3,", ""))
-    assert(result("minValues") === Map("id" -> 1, "s" -> "abc", "i" -> 7, "d" -> "2024-01-02"))
-    assert(result("maxValues") === Map("id" -> 3, "s" -> "abc", "i" -> 7, "d" -> "2024-01-02"))
+      addStats(stats, values, fields).replace("\"numRecords\":3,", ""))
+    val expectedMinMax = Map("s" -> "abc", "i" -> 7, "d" -> "2024-01-02", "dec" -> 1.5)
+    assert(result("minValues") === Map("id" -> 1) ++ expectedMinMax)
+    assert(result("maxValues") === Map("id" -> 3) ++ expectedMinMax)
     assert(result("nullCount") ===
-      Map("id" -> 0, "s" -> 0, "i" -> 0, "d" -> 0, "t" -> 0, "n" -> 3))
+      Map("id" -> 0, "s" -> 0, "i" -> 0, "d" -> 0, "t" -> 0, "n" -> 3, "dec" -> 0))
     // Long strings are not added since collected string stats would be truncated.
-    assert(!ReplacePartitionedByUtils.addPartitionValuesToStats(
-      stats, Map("s" -> ("x" * 33)), fields.take(1), 32).contains("xxx"))
+    assert(!addStats(stats, Map("s" -> ("x" * 33)), fields.take(1)).contains("xxx"))
     // Files without stats are left untouched.
-    assert(ReplacePartitionedByUtils.addPartitionValuesToStats(null, values, fields, 32) === null)
-    assert(ReplacePartitionedByUtils.addPartitionValuesToStats("", values, fields, 32) === "")
+    assert(addStats(null, values, fields) === null)
+    assert(addStats("", values, fields) === "")
+  }
+
+  test("an empty string partition value gets no statistics") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"CREATE TABLE delta.`$path` (id BIGINT, p STRING) USING delta PARTITIONED BY (p)")
+      sql(s"INSERT INTO delta.`$path` VALUES (1, 'a')")
+      // Delta writes null partition values as null, but the protocol also allows an empty
+      // string. Add such a file, which stores a null in the data.
+      val manualDir = new File(dir, "manual")
+      spark.range(2, 3).selectExpr("id", "cast(null as string) as p").coalesce(1)
+        .write.parquet(manualDir.getCanonicalPath)
+      val dataFile = manualDir.listFiles().filter(_.getName.endsWith(".parquet")).head
+      val deltaLog = DeltaLog.forTable(spark, path)
+      deltaLog.startTransaction().commit(
+        Seq(AddFile(
+          path = s"manual/${dataFile.getName}",
+          partitionValues = Map("p" -> ""),
+          size = dataFile.length(),
+          modificationTime = dataFile.lastModified(),
+          dataChange = true,
+          stats = """{"numRecords":1}""")),
+        DeltaOperations.ManualUpdate)
+
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+
+      val file = deltaLog.update().allFiles.collect().find(_.path.startsWith("manual/")).get
+      assert(!statsOf(file)("nullCount").asInstanceOf[Map[String, Any]].contains("p"))
+      assert(!statsOf(file)("minValues").asInstanceOf[Map[String, Any]].contains("p"))
+      // The file is not skipped.
+      checkAnswer(readTable(path).where("p IS NULL").select("id"), Row(2L))
+    }
+  }
+
+  private def statsColumnsOf(deltaLog: DeltaLog): Option[String] =
+    deltaLog.update().metadata.configuration.get(DeltaConfigs.DATA_SKIPPING_STATS_COLUMNS.key)
+
+  test("keeps the statistics of a wide table") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      // 40 data columns. Statistics are collected on the first 32 data columns, c0 to c31.
+      // Partition column p is before c31, q is after it.
+      val dataColumns = (0 until 40).map(i => s"id + $i as c$i")
+      val columns = dataColumns.take(5) ++ Seq("cast(id % 5 as string) as p") ++
+        dataColumns.drop(5) ++ Seq("cast(id % 2 as int) as q")
+      spark.range(0, 100, 1, 4).selectExpr(columns: _*)
+        .write.format("delta").partitionBy("p", "q").save(path)
+      val deltaLog = DeltaLog.forTable(spark, path)
+      assert(statsColumnsOf(deltaLog).isEmpty)
+      val expected = readTable(path).collect()
+
+      // Clustering by q requires statistics on q.
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY (q)")
+
+      val indexedColumns = (0 until 32).map(i => s"c$i") ++ Seq("p", "q")
+      assert(statsColumnsOf(deltaLog) === Some(indexedColumns.mkString(",")))
+      checkAnswer(readTable(path), expected)
+      val numFiles = deltaLog.update().numOfFiles
+      for (predicate <- Seq("p = '3'", "q = 1", "c31 = 31")) {
+        assert(filesRead(spark, deltaLog, predicate, checkEmptyUnusedFilters = false) < numFiles,
+          predicate)
+      }
+
+      // New files have statistics on the same columns.
+      val filesBefore = deltaLog.update().allFiles.collect().map(_.path).toSet
+      spark.range(100, 110).selectExpr(columns: _*)
+        .write.format("delta").mode("append").save(path)
+      val newFiles = deltaLog.update().allFiles.collect().filterNot(f => filesBefore(f.path))
+      assert(newFiles.nonEmpty)
+      newFiles.foreach { f =>
+        assert(statsOf(f)("minValues").asInstanceOf[Map[String, Any]].keySet ===
+          indexedColumns.toSet)
+      }
+    }
+  }
+
+  test("adds the former partition columns to delta.dataSkippingStatsColumns") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"""CREATE TABLE delta.`$path` (id BIGINT, v BIGINT, p STRING, flag BOOLEAN)
+             |USING delta PARTITIONED BY (p, flag)
+             |TBLPROPERTIES ('delta.dataSkippingStatsColumns' = 'id')""".stripMargin)
+      sql(s"INSERT INTO delta.`$path` VALUES (1, 1, 'a', true), (2, 2, 'b', false)")
+      val deltaLog = DeltaLog.forTable(spark, path)
+
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+
+      // Boolean columns cannot be listed.
+      assert(statsColumnsOf(deltaLog) === Some("id,p"))
+      assert(filesRead(spark, deltaLog, "p = 'b'", checkEmptyUnusedFilters = false) === 1)
+      checkAnswer(readTable(path).where("p = 'b'").select("id"), Row(2L))
+    }
+  }
+
+  test("streaming queries across the conversion") {
+    withTempDir { dir =>
+      val path = new File(dir, "source").getCanonicalPath
+      createPartitionedTable(path, "p")
+      def runStream(name: String, schemaTracking: Boolean): DataFrame = {
+        val checkpoint = new File(dir, s"checkpoint-$name").getCanonicalPath
+        val sinkPath = new File(dir, s"sink-$name").getCanonicalPath
+        val reader = spark.readStream.format("delta")
+        val source =
+          if (schemaTracking) reader.option("schemaTrackingLocation", checkpoint) else reader
+        source.load(path).writeStream.format("delta")
+          .option("checkpointLocation", checkpoint)
+          .trigger(Trigger.AvailableNow())
+          .start(sinkPath)
+          .awaitTermination()
+        spark.read.format("delta").load(sinkPath)
+      }
+      def assertStreamFails(name: String, schemaTracking: Boolean, errorClass: String): Unit = {
+        val e = intercept[StreamingQueryException] { runStream(name, schemaTracking) }
+        assert(e.getMessage.contains(errorClass))
+      }
+      runStream("plain", schemaTracking = false)
+      runStream("tracking", schemaTracking = true)
+
+      sql(s"ALTER TABLE delta.`$path` REPLACE PARTITIONED BY WITH CLUSTER BY NONE")
+      spark.range(100, 110).selectExpr("id", "'9' as p", "cast(id % 3 as int) as q", "id * 2 as v")
+        .write.format("delta").mode("append").save(path)
+      val expected = readTable(path).collect()
+      assert(expected.length === 110)
+
+      // As for any change of the partitioning, a stream fails at the conversion, because the
+      // files added after it cannot be read with the partitioning the stream started with.
+      // Without schema tracking, the stream keeps failing when it is restarted.
+      for (_ <- 1 to 2) {
+        assertStreamFails("plain", schemaTracking = false, "DELTA_SCHEMA_CHANGED_WITH_VERSION")
+      }
+      // With schema tracking, the stream records the new metadata and continues after a restart.
+      assertStreamFails("tracking", schemaTracking = true, "DELTA_STREAMING_METADATA_EVOLUTION")
+      checkAnswer(runStream("tracking", schemaTracking = true), expected)
+      // A new stream reads the converted table.
+      checkAnswer(runStream("new", schemaTracking = false), expected)
+    }
   }
 }

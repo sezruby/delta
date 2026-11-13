@@ -24,20 +24,24 @@ import scala.util.Try
 import org.apache.spark.sql.delta.skipping.clustering.ClusteredTableUtils
 import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
 import org.apache.spark.sql.delta._
-import org.apache.spark.sql.delta.actions.Action
+import org.apache.spark.sql.delta.actions.{Action, Metadata}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.schema.SchemaMergingUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
-import org.apache.spark.sql.delta.stats.DeltaStatistics
+import org.apache.spark.sql.delta.stats.{DeltaStatistics, SkippingEligibleDataType, StatisticsCollection}
 import org.apache.spark.sql.delta.util.{DeltaFileOperations, JsonUtils}
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.node.{DecimalNode, LongNode, ObjectNode, TextNode}
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 
 import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.expressions.{Cast, Literal}
 import org.apache.spark.sql.connector.expressions.FieldReference
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFooterReaderShims
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.SerializableConfiguration
 
 /**
@@ -58,6 +62,15 @@ import org.apache.spark.util.SerializableConfiguration
  * physically stored in every data file (see `delta.writePartitionColumnsToParquet` and the
  * `materializePartitionColumns` table feature). This is verified by reading the Parquet footers
  * before committing.
+ *
+ * When a former partition column would not get statistics anymore, because it is after the first
+ * `delta.dataSkippingNumIndexedCols` columns or not in `delta.dataSkippingStatsColumns`, the
+ * conversion sets `delta.dataSkippingStatsColumns` so that the columns that had statistics before
+ * and the former partition columns keep them.
+ *
+ * As for any change of the partitioning, streaming queries reading the table fail when they reach
+ * the conversion. A query with a `schemaTrackingLocation` continues after a restart; other queries
+ * must be restarted with a new checkpoint.
  *
  * The commit is done with [[OptimisticTransaction.commitLarge]], which fails if any other commit
  * happened since the transaction started. Hence no file can be added concurrently between the
@@ -80,22 +93,24 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
       ClusteredTableUtils.validateNumClusteringColumns(clusteringColumns, Some(deltaLog))
 
       val physicalPartitionSchema = oldMetadata.physicalPartitionSchema
-      if (sparkSession.sessionState.conf.getConf(
-          DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_VERIFY_MATERIALIZED_PARTITION_COLUMNS)) {
-        ReplacePartitionedByUtils.verifyPartitionColumnsMaterialized(
-          sparkSession, deltaLog, snapshot, oldMetadata.partitionColumns,
-          physicalPartitionSchema.fieldNames.toSeq)
-      }
+      val conf = sparkSession.sessionState.conf
 
+      // Update the metadata and validate the clustering columns before reading the footers of all
+      // data files below, so that invalid commands fail fast.
       val newLogicalClusteringColumns = clusteringColumns.map(FieldReference(_).toString)
       val baseConfiguration = oldMetadata.configuration
-      val newConfiguration =
+      val clusteringConfiguration =
         if (clusteringColumns.nonEmpty && !ClusteredTableUtils.isSupported(txn.protocol)) {
-          baseConfiguration ++ ClusteredTableUtils.getTableFeatureProperties(baseConfiguration)
+          ClusteredTableUtils.getTableFeatureProperties(baseConfiguration)
         } else {
-          baseConfiguration
+          Map.empty[String, String]
         }
-      txn.updateMetadata(oldMetadata.copy(partitionColumns = Nil, configuration = newConfiguration))
+      val unpartitionedMetadata = oldMetadata.copy(
+        partitionColumns = Nil, configuration = baseConfiguration ++ clusteringConfiguration)
+      val statsColumnsConfiguration =
+        ReplacePartitionedByUtils.statsColumnsConfiguration(oldMetadata, unpartitionedMetadata)
+      txn.updateMetadata(unpartitionedMetadata.copy(
+        configuration = unpartitionedMetadata.configuration ++ statsColumnsConfiguration))
 
       val domainMetadata = if (clusteringColumns.nonEmpty) {
         ClusteredTableUtils.validateClusteringColumnsInStatsSchema(
@@ -106,8 +121,15 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
         Nil
       }
 
-      val stringPrefixLength = sparkSession.sessionState.conf.getConf(
-        DeltaSQLConf.DATA_SKIPPING_STRING_PREFIX_LENGTH)
+      if (conf.getConf(
+          DeltaSQLConf.DELTA_REPLACE_PARTITIONED_BY_VERIFY_MATERIALIZED_PARTITION_COLUMNS)) {
+        ReplacePartitionedByUtils.verifyPartitionColumnsMaterialized(
+          sparkSession, deltaLog, snapshot, oldMetadata.partitionColumns,
+          physicalPartitionSchema.fieldNames.toSeq)
+      }
+
+      val stringPrefixLength = conf.getConf(DeltaSQLConf.DATA_SKIPPING_STRING_PREFIX_LENGTH)
+      val timeZoneId = conf.sessionLocalTimeZone
       val partitionFields = physicalPartitionSchema.fields.toSeq
       import org.apache.spark.sql.delta.implicits._
       val newAddFiles = snapshot.allFiles.mapPartitions { files =>
@@ -116,7 +138,7 @@ case class AlterTableReplacePartitionedByWithClusterByDeltaCommand(
             partitionValues = Map.empty,
             dataChange = false,
             stats = ReplacePartitionedByUtils.addPartitionValuesToStats(
-              file.stats, file.partitionValues, partitionFields, stringPrefixLength))
+              file.stats, file.partitionValues, partitionFields, stringPrefixLength, timeZoneId))
         }
       }
 
@@ -180,19 +202,97 @@ object ReplacePartitionedByUtils {
   }
 
   /**
+   * Returns the table configuration that keeps statistics on the former partition columns, and on
+   * all the columns that had statistics before, once the partitioning is dropped.
+   *
+   * Partition columns are not data columns, so they do not count towards
+   * `delta.dataSkippingNumIndexedCols` and cannot be listed in `delta.dataSkippingStatsColumns`.
+   * Once they become data columns, a former partition column after the first indexed columns
+   * would get no statistics (the synthesized ones would be ignored too), and a former partition
+   * column before the last indexed column would push that column out of the indexed columns. In
+   * these cases `delta.dataSkippingStatsColumns` is set to the columns that had statistics before
+   * followed by the former partition columns. Top-level columns of a type that does not support
+   * data skipping cannot be listed and are left out.
+   */
+  def statsColumnsConfiguration(
+      partitionedMetadata: Metadata,
+      unpartitionedMetadata: Metadata): Map[String, String] = {
+    def isListable(field: StructField): Boolean =
+      field.dataType.isInstanceOf[StructType] || SkippingEligibleDataType(field.dataType)
+    def key(path: Seq[String]): Seq[String] = path.map(_.toLowerCase(Locale.ROOT))
+
+    val formerPartitionColumns = partitionedMetadata.partitionSchema.fields.toSeq
+      .filter(isListable).map(field => Seq(field.name))
+    val indexedBefore = StructType(indexedColumns(partitionedMetadata).fields.filter(isListable))
+    val indexedAfter = leafPaths(indexedColumns(unpartitionedMetadata)).map(key).toSet
+    val required = leafPaths(indexedBefore) ++ formerPartitionColumns
+    if (required.forall(path => indexedAfter.contains(key(path)))) return Map.empty
+
+    val formerPartitionColumnNames = formerPartitionColumns.map(UnresolvedAttribute(_).sql)
+    val statsColumns =
+      DeltaConfigs.DATA_SKIPPING_STATS_COLUMNS.fromMetaData(partitionedMetadata) match {
+        case Some(configured) => configured.trim +: formerPartitionColumnNames
+        case None =>
+          statsColumnNames(indexedBefore, partitionedMetadata.dataSchema)
+            .map(UnresolvedAttribute(_).sql) ++ formerPartitionColumnNames
+      }
+    Map(DeltaConfigs.DATA_SKIPPING_STATS_COLUMNS.key ->
+      statsColumns.filter(_.nonEmpty).mkString(","))
+  }
+
+  /** The logical data schema pruned to the columns that statistics are collected on. */
+  private def indexedColumns(metadata: Metadata): StructType = {
+    val dataSchema = metadata.dataSchema
+    StatisticsCollection.getIndexedColumns(
+      SchemaMergingUtils.explodeNestedFieldNames(dataSchema),
+      StatisticsCollection.configuredDeltaStatsColumnSpec(metadata),
+      dataSchema,
+      NoMapping)
+  }
+
+  private def leafPaths(schema: StructType, prefix: Seq[String] = Nil): Seq[Seq[String]] =
+    schema.fields.toSeq.flatMap { field =>
+      field.dataType match {
+        case struct: StructType => leafPaths(struct, prefix :+ field.name)
+        case _ => Seq(prefix :+ field.name)
+      }
+    }
+
+  /**
+   * Returns the names to list in `delta.dataSkippingStatsColumns` to collect statistics on the
+   * columns of `indexed`, a pruned version of `schema`. A struct is listed by its name when none of
+   * its fields are pruned.
+   */
+  private def statsColumnNames(
+      indexed: StructType,
+      schema: StructType,
+      prefix: Seq[String] = Nil): Seq[Seq[String]] =
+    indexed.fields.toSeq.flatMap { field =>
+      (field.dataType, schema(field.name).dataType) match {
+        case (struct: StructType, fullStruct: StructType) if struct != fullStruct =>
+          statsColumnNames(struct, fullStruct, prefix :+ field.name)
+        case _ => Seq(prefix :+ field.name)
+      }
+    }
+
+  /**
    * Adds min/max/nullCount statistics for the given partition columns to the stats JSON of a
    * file, using the file's partition values. Every row in a file has the same value for a
    * partition column, so these statistics are exact. Statistics that already exist are kept, and
    * no statistics are added if the file has none.
    *
-   * Min/max values are only synthesized for types whose JSON stats representation is the same as
-   * the partition value representation; other types only get a null count.
+   * A partition value is parsed the same way as when it is read as a partition value. No
+   * statistics are added for a column whose value is an empty string or cannot be cast to the
+   * column type, because the value stored in the data file for it is not known. Min/max values are
+   * only synthesized for string, integral, decimal and date columns; other types only get a null
+   * count.
    */
   def addPartitionValuesToStats(
       stats: String,
       partitionValues: Map[String, String],
       partitionFields: Seq[StructField],
-      stringPrefixLength: Int): String = {
+      stringPrefixLength: Int,
+      timeZoneId: String): String = {
     if (stats == null || stats.isEmpty) return stats
     val root = Try(JsonUtils.mapper.readTree(stats)).toOption match {
       case Some(o: ObjectNode) => o
@@ -215,27 +315,35 @@ object ReplacePartitionedByUtils {
       partitionValues.getOrElse(name, null) match {
         case null =>
           nullCounts.filterNot(_.has(name)).foreach(_.put(name, numRecords.asLong))
+        case "" =>
+          // The protocol defines an empty string as a null partition value, but Delta reads it as
+          // an empty string for string columns, so the file may store either.
         case value =>
-          nullCounts.filterNot(_.has(name)).foreach(_.put(name, 0L))
-          toStatsValue(value, field.dataType, stringPrefixLength).foreach { v =>
-            minValues.filterNot(_.has(name)).foreach(_.set[JsonNode](name, v))
-            maxValues.filterNot(_.has(name)).foreach(_.set[JsonNode](name, v))
+          val parsed = Cast(Literal(value), field.dataType, Option(timeZoneId), ansiEnabled = false)
+            .eval()
+          if (parsed != null) {
+            nullCounts.filterNot(_.has(name)).foreach(_.put(name, 0L))
+            toStatsValue(parsed, field.dataType, stringPrefixLength).foreach { v =>
+              minValues.filterNot(_.has(name)).foreach(_.set[JsonNode](name, v))
+              maxValues.filterNot(_.has(name)).foreach(_.set[JsonNode](name, v))
+            }
           }
       }
     }
     JsonUtils.mapper.writeValueAsString(root)
   }
 
-  private def toStatsValue(value: String, dataType: DataType, stringPrefixLength: Int)
-      : Option[JsonNode] = dataType match {
+  /** Converts a value of the given type, as returned by [[Cast]], to its JSON stats value. */
+  private def toStatsValue(value: Any, dataType: DataType, stringPrefixLength: Int)
+      : Option[JsonNode] = (dataType, value) match {
     // Longer strings would need to be truncated the same way as collected stats.
-    case StringType if value.length <= stringPrefixLength => Some(TextNode.valueOf(value))
-    case ByteType | ShortType | IntegerType | LongType =>
-      Try(value.trim.toLong).toOption.map(LongNode.valueOf)
-    case _: DecimalType =>
-      Try(new java.math.BigDecimal(value.trim)).toOption.map(DecimalNode.valueOf)
-    case DateType =>
-      Try(java.time.LocalDate.parse(value.trim)).toOption.map(d => TextNode.valueOf(d.toString))
+    case (StringType, s: UTF8String) if s.numChars <= stringPrefixLength =>
+      Some(TextNode.valueOf(s.toString))
+    case (ByteType | ShortType | IntegerType | LongType, n: java.lang.Number) =>
+      Some(LongNode.valueOf(n.longValue))
+    case (_: DecimalType, d: Decimal) => Some(DecimalNode.valueOf(d.toJavaBigDecimal))
+    case (DateType, days: Int) =>
+      Some(TextNode.valueOf(java.time.LocalDate.ofEpochDay(days.toLong).toString))
     case _ => None
   }
 }
