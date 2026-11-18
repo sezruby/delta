@@ -16,6 +16,8 @@
 
 package org.apache.spark.sql.delta.commands
 
+import java.util.Locale
+
 import org.apache.spark.sql.delta.{
   CatalogManagedTableMaintenanceOperation,
   DeltaColumnMapping,
@@ -27,7 +29,7 @@ import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.{LeafCommand, LogicalPlan, UnaryCommand}
 
 object DeltaReorgTableMode extends Enumeration {
-  val PURGE, UNIFORM_ICEBERG, REWRITE_TYPE_WIDENING = Value
+  val PURGE, UNIFORM_ICEBERG, REWRITE_TYPE_WIDENING, MATERIALIZE_PARTITION_COLUMNS = Value
 }
 
 case class DeltaReorgTableSpec(
@@ -75,7 +77,8 @@ case class DeltaReorgTableCommand(
 
   override def run(sparkSession: SparkSession): Seq[Row] = reorgTableSpec match {
     case DeltaReorgTableSpec(
-        DeltaReorgTableMode.PURGE | DeltaReorgTableMode.REWRITE_TYPE_WIDENING, None) =>
+        DeltaReorgTableMode.PURGE | DeltaReorgTableMode.REWRITE_TYPE_WIDENING |
+          DeltaReorgTableMode.MATERIALIZE_PARTITION_COLUMNS, None) =>
       optimizeByReorg(sparkSession)
     case DeltaReorgTableSpec(DeltaReorgTableMode.UNIFORM_ICEBERG, Some(icebergCompatVersion)) =>
       val table = getDeltaTable(target, "REORG")
@@ -93,6 +96,8 @@ case class DeltaReorgTableCommand(
       new DeltaUpgradeUniformOperation(icebergCompatVersion)
     case DeltaReorgTableSpec(DeltaReorgTableMode.REWRITE_TYPE_WIDENING, None) =>
       new DeltaRewriteTypeWideningOperation()
+    case DeltaReorgTableSpec(DeltaReorgTableMode.MATERIALIZE_PARTITION_COLUMNS, None) =>
+      new DeltaMaterializePartitionColumnsOperation()
   }
 }
 
@@ -165,6 +170,26 @@ class DeltaRewriteTypeWideningOperation extends DeltaReorgOperation with ReorgTa
     val physicalSchema = DeltaColumnMapping.renameColumns(snapshot.schema)
     filterParquetFilesOnExecutors(spark, files, snapshot, ignoreCorruptFiles = false) {
       schema => fileHasDifferentTypes(schema, physicalSchema)
+    }
+  }
+}
+
+/**
+ * Internal reorg operation to rewrite the files that do not store all partition columns, before
+ * `ALTER TABLE ... REPLACE PARTITIONED BY` drops the partitioning. The new files store them as
+ * long as the table writes partition columns (see `TransactionalWrite.writesPartitionColumns`).
+ */
+class DeltaMaterializePartitionColumnsOperation
+    extends DeltaReorgOperation with ReorgTableHelper {
+  override def filterFilesToReorg(
+      spark: SparkSession,
+      snapshot: SnapshotDescriptor,
+      files: Seq[AddFile]): Seq[AddFile] = {
+    val partitionColumns =
+      snapshot.metadata.physicalPartitionSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSeq
+    filterParquetFilesOnExecutors(spark, files, snapshot, ignoreCorruptFiles = false) { schema =>
+      val fileColumns = schema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+      !partitionColumns.forall(fileColumns.contains)
     }
   }
 }

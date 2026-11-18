@@ -4378,6 +4378,14 @@ trait DeltaErrorsBase
         partitionColumns.mkString(", "), numFiles.toString, examplePaths.mkString(", ")))
   }
 
+  def replacePartitionedByWritePartitionColumnsDisabledException(
+      partitionColumns: Seq[String],
+      examplePaths: Seq[String]): Throwable = {
+    new DeltaAnalysisException(
+      errorClass = "DELTA_REPLACE_PARTITIONED_BY_WRITE_PARTITION_COLUMNS_DISABLED",
+      messageParameters = Array(partitionColumns.mkString(", "), examplePaths.mkString(", ")))
+  }
+
   def createTableWithDifferentClusteringException(
       path: Path,
       specifiedClusterBySpec: Option[ClusterBySpec],
