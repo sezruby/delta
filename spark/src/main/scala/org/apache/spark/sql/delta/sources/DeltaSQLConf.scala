@@ -2890,6 +2890,15 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_REPLACE_PARTITIONED_BY_REWRITE_NON_MATERIALIZED_FILES =
+    buildConf("alterTable.replacePartitionedBy.rewriteNonMaterializedFiles")
+      .internal()
+      .doc("""When true, ALTER TABLE ... REPLACE PARTITIONED BY WITH CLUSTER BY first rewrites the
+        |data files that do not store the partition columns, with REORG commits, and then drops
+        |the partitioning. When false, the command fails if such files exist.""".stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_BYPASS_CHARVARCHAR_TO_STRING_FIX =
     buildConf("alterTable.bypassCharVarcharToStringFix")
       .internal()

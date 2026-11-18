@@ -474,10 +474,7 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
         statsTrackers.append(basicWriteJobStatsTracker)
       }
 
-      // Iceberg spec requires partition columns in data files
-      val writePartitionColumns = IcebergCompat.isAnyEnabled(metadata) ||
-        protocol.isFeatureSupported(MaterializePartitionColumnsTableFeature) ||
-        DeltaConfigs.WRITE_PARTITION_COLUMNS_TO_PARQUET.fromMetaData(metadata).getOrElse(true)
+      val writePartitionColumns = TransactionalWrite.writesPartitionColumns(metadata, protocol)
       // Retain only a minimal selection of Spark writer options to avoid any potential
       // compatibility issues
       val filteredOptions = (writeOptions match {
@@ -586,6 +583,14 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
 }
 
 object TransactionalWrite {
+  /** Whether the data files written to the table store the values of its partition columns. */
+  def writesPartitionColumns(metadata: Metadata, protocol: Protocol): Boolean = {
+    // Iceberg spec requires partition columns in data files
+    IcebergCompat.isAnyEnabled(metadata) ||
+      protocol.isFeatureSupported(MaterializePartitionColumnsTableFeature) ||
+      DeltaConfigs.WRITE_PARTITION_COLUMNS_TO_PARQUET.fromMetaData(metadata).getOrElse(true)
+  }
+
   def shouldOptimizeWrite(metadata: Metadata, sessionConf: SQLConf): Boolean = {
     sessionConf.getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED)
       .orElse(DeltaConfigs.OPTIMIZE_WRITE.fromMetaData(metadata))

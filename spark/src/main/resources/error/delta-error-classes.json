@@ -2840,6 +2840,13 @@
     ],
     "sqlState" : "0AKDC"
   },
+  "DELTA_REPLACE_PARTITIONED_BY_WRITE_PARTITION_COLUMNS_DISABLED" : {
+    "message" : [
+      "Cannot rewrite the data files that do not store the partition column(s) <partitionColumns>, for example: <examplePaths>, because the table property delta.writePartitionColumnsToParquet is false.",
+      "Set it to true and run ALTER TABLE REPLACE PARTITIONED BY again."
+    ],
+    "sqlState" : "55000"
+  },
   "DELTA_REPLACE_TABLE_WITH_CATALOG_MANAGED_NOT_SUPPORTED" : {
     "message" : [
       "REPLACE TABLE cannot enable catalog-managed on the existing non-catalog-managed table <tableName>. Upgrade or recreate the table instead."
